@@ -1,91 +1,81 @@
-name: Build
+name: Build Arch Linux RootFS (xaga mainline)
 
 # =============================================================================
-# xaga (MT6895 / 天玑8100 / Redmi Note 11T Pro) —— RootFS 根文件系统构建
+# 为 Redmi Note 11T Pro (xaga / MT6895 / 天玑8100) 主线 7.2 内核构建
+# Arch Linux ARM 根文件系统，并把当前内核编译出来的模块注进去。
 #
-# 本工作流只做 RootFS（内核编译已移除，见 .github/workflows/ 其他文件）
-#
-# 可构建的系统:
-#   postmarketOS edge (phosh / none / plasma-mobile)
-#   Arch Linux ARM
-#   Debian 12 (bookworm)
-#   Ubuntu 24.04 LTS (noble) / 25.10 (questing) / 26.04 LTS (resolute)
-#
-# 硬约束（来自 MT6895-Mainline/initramfs 的 init.c + 实机踩坑记录）:
-#   * userdata 上的 rootfs 必须是 ext4
-#     - 原厂内核命名 /dev/sdc86，主线内核命名 /dev/mmcblk0p86（同一个分区）
-#   * initramfs 不读 cmdline，pivot 后直接 execve /sbin/init
-#     - systemd 发行版: /sbin/init -> systemd；pmOS: /sbin/init = openrc
-#   * WiFi NVRAM 在 nvdata (/dev/sdc13, 只读 ext4)，由 initramfs 提供
-#     - rootfs 必须有 mediatek 固件，否则 WiFi/蓝牙/声卡/触控全废
-#   * 构建过程不使用 loop 设备: bootstrap 到目录 -> mkfs.ext4 -d 直接出镜像
-#     （只有 pmOS 例外：pmbootstrap 自身依赖 loop）
-#
-# 产物: xaga-rootfs-<id>-<release>/
-#         ├── xaga-rootfs-<id>-<release>.tar.zst  (含 .img / -sparse.img)
-#         └── SHA256SUMS-xaga-rootfs-<id>-<release>.txt
+# 与旧工作流的差异（都是本轮实测踩出来的，别改回去）：
+#   1. defconfig 用 merge_config.sh 合并 defconfig + xaga.config。
+#      xaga.config 是 fragment，不是完整 defconfig，直接当 defconfig 用会缺一大片配置。
+#   2. **必须关掉 MT8183/8188/8192/8195/8365 + SOF MT8186/8195**，否则
+#      mt8183-afe-pcm.c 与 common/mtk-base-afe.h 的 MTK_AFE_RATE_* 枚举重定义直接编挂。
+#   3. 关掉 CONFIG_WERROR，避免新版 clang 的新警告升级成错误。
+#   4. 首次构建关 Rust（要 rustc 1.85+ / bindgen 0.71+）。
+#   5. rootfs 走 "解包到目录 + mkfs.ext4 -d"，**不依赖 loop 设备**。
+#   6. 内核模块由 kernel job 以 artifact 传入，注入后在 aarch64 chroot 里 depmod。
+#   7. 6+128 机型 cmdline 带 mem=6G（DT 的 memory 节点写死 8 GiB）。
 # =============================================================================
-
 on:
   workflow_dispatch:
     inputs:
-      ROOTFS_TYPE:
-        description: "RootFS 发行版 (all = 全部系统各构建一份)"
+      ROOTFS_SIZE:
+        description: "rootfs 镜像大小"
         required: true
-        default: "Arch Linux ARM"
-        type: choice
-        options:
-          - "all"
-          - "Arch Linux ARM"
-          - "Debian 12"
-          - "Ubuntu 24.04 LTS"
-          - "Ubuntu 25.10"
-          - "Ubuntu 26.04 LTS"
-          - "postmarketOS"
-      PMOS_UI:
-        description: "postmarketOS 桌面环境 (仅 pmOS 生效)"
-        required: false
-        default: "phosh"
-        type: choice
-        options:
-          - "phosh"
-          - "none"
-          - "plasma-mobile"
-      SIZE:
-        description: "镜像大小 (6+128 机器默认 6G)"
-        required: true
-        default: "6G"
+        default: "4G"
         type: string
-      HOSTNAME:
-        description: "主机名"
+      ROOT_PART:
+        description: "物理 root 分区（主线内核是 mmcblk 命名，不是 sdc）"
         required: true
-        default: "xaga"
+        default: "/dev/mmcblk0p86"
+        type: string
+      MEM_LIMIT:
+        description: "cmdline mem= 限制（6+128 填 6G；留空=不限制）"
+        required: false
+        default: "6G"
         type: string
       ROOT_PASSWORD:
         description: "root 密码"
         required: true
         default: "1234"
         type: string
-      MAKE_SPARSE:
-        description: "同时生成 sparse 镜像 (fastboot flash 用这个)"
-        required: false
-        default: true
-        type: boolean
-      INSTALL_FIRMWARE:
-        description: "安装 mediatek 固件 (强烈建议开启，否则无线/触控失效)"
-        required: false
-        default: true
-        type: boolean
       EXTRA_PACKAGES:
-        description: "额外软件包，空格分隔 (例如 openssh-server vim)"
+        description: "Arch 软件包（空格分隔，不含固件包）"
         required: false
-        default: "openssh-server"
+        default: "networkmanager iwd openssh sudo vim less curl wget ca-certificates"
         type: string
-      MIRROR:
-        description: "软件源镜像 (留空用官方源，例如 https://mirrors.ustc.edu.cn/debian)"
+      FIRMWARE_PACKAGE:
+        description: "联发科固件包（rootfs 缺了 WiFi/蓝牙/触控会废）"
         required: false
-        default: ""
+        default: "linux-firmware-mediatek"
         type: string
+      KERNEL_IMAGE:
+        description: "打包进 boot.img 的内核镜像（gzip 更小且与原厂一致）"
+        required: true
+        default: "Image.gz"
+        type: choice
+        options:
+          - "Image.gz"
+          - "Image"
+      CLANG_VERSION:
+        description: "LLVM Clang 版本"
+        required: true
+        default: "18"
+        type: string
+      KERNEL_COMMIT:
+        description: "内核 commit（留空用分支头）"
+        required: false
+        default: "4fadce8d6bbce016a8965ad93a5285c565401c1d"
+        type: string
+      INITRAMFS_COMMIT:
+        description: "initramfs commit（留空用分支头）"
+        required: false
+        default: "126b0c137338c1ec6a2cbc434bd67239ce2e38c7"
+        type: string
+      UPLOAD_RAW_IMG:
+        description: "同时上传未压缩的 rootfs.img（体积大）"
+        required: false
+        default: false
+        type: boolean
       ENABLE_NOTIFY:
         description: "开启钉钉/Server酱构建通知"
         required: false
@@ -93,544 +83,392 @@ on:
         type: boolean
 
 env:
-  # 主线内核把 userdata 叫 mmcblk0p86，原厂内核叫 sdc86，是同一个分区
-  ROOT_PART_MAINLINE: "/dev/mmcblk0p86"
-  ROOT_PART_ANDROID: "/dev/sdc86"
-  NVDATA_PART: "/dev/sdc13"        # WiFi NVRAM，只读 ext4
-  # 注意: runner 上下文在 workflow 级 env 里不可用，会报
-  # "Unrecognized named-value: 'runner'" —— 路径类变量必须下放到 job 级 env
-  DEBIAN_FRONTEND: noninteractive
+  KERNEL_REPO: "MT6895-Mainline/linux"
+  KERNEL_BRANCH: "7.2-mt6895-xiaomi-xaga"
+  INITRAMFS_REPO: "MT6895-Mainline/initramfs"
+  CCACHE_MAXSIZE: "2G"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xaga-arch-rootfs-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # 1) 计划: 把选项翻译成构建矩阵
-  # ---------------------------------------------------------------------------
-  plan:
-    name: 构建计划
+  # ==========================================================
+  # Job 1：编译主线内核，产出内核模块 + boot.img
+  # ==========================================================
+  kernel:
+    name: 编译主线内核 & 模块
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     outputs:
-      matrix: ${{ steps.gen.outputs.matrix }}
-      size: ${{ steps.gen.outputs.size }}
-      hostname: ${{ steps.gen.outputs.hostname }}
-      rootpw: ${{ steps.gen.outputs.rootpw }}
-      make_sparse: ${{ steps.gen.outputs.make_sparse }}
-      install_firmware: ${{ steps.gen.outputs.install_firmware }}
-      extra_packages: ${{ steps.gen.outputs.extra_packages }}
-      mirror: ${{ steps.gen.outputs.mirror }}
-    env:
-      IN_TYPE: ${{ inputs.ROOTFS_TYPE }}
-      IN_UI: ${{ inputs.PMOS_UI }}
-      IN_SIZE: ${{ inputs.SIZE }}
-      IN_HOST: ${{ inputs.HOSTNAME }}
-      IN_PW: ${{ inputs.ROOT_PASSWORD }}
-      IN_SPARSE: ${{ inputs.MAKE_SPARSE }}
-      IN_FW: ${{ inputs.INSTALL_FIRMWARE }}
-      IN_PKGS: ${{ inputs.EXTRA_PACKAGES }}
-      IN_MIRROR: ${{ inputs.MIRROR }}
+      kver: ${{ steps.kver.outputs.kver }}
     steps:
-      - name: 生成矩阵
-        id: gen
+      - name: Checkout 本仓库
+        uses: actions/checkout@v5
+
+      - name: 安装依赖 & LLVM 工具链
         run: |
-          set -euo pipefail
+          sudo apt update -y
+          sudo apt install -y --no-install-recommends \
+            build-essential bison flex libelf-dev libssl-dev cpio lz4 wget git ccache \
+            device-tree-compiler f2fs-tools util-linux
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${{ inputs.CLANG_VERSION }} main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt update
+          sudo apt install -y clang-${{ inputs.CLANG_VERSION }} llvm-${{ inputs.CLANG_VERSION }} lld-${{ inputs.CLANG_VERSION }}
+          CLANG_VER=${{ inputs.CLANG_VERSION }}
+          sudo ln -sf /usr/bin/clang-${CLANG_VER} /usr/bin/clang
+          sudo ln -sf /usr/bin/clang++-${CLANG_VER} /usr/bin/clang++
+          sudo ln -sf /usr/bin/lld-${CLANG_VER} /usr/bin/lld
+          sudo ln -sf /usr/bin/ld.lld-${CLANG_VER} /usr/bin/ld.lld
+          sudo ln -sf /usr/bin/llvm-ar-${CLANG_VER} /usr/bin/llvm-ar
+          sudo ln -sf /usr/bin/llvm-nm-${CLANG_VER} /usr/bin/llvm-nm
+          sudo ln -sf /usr/bin/llvm-objcopy-${CLANG_VER} /usr/bin/llvm-objcopy
+          sudo ln -sf /usr/bin/llvm-readelf-${CLANG_VER} /usr/bin/llvm-readelf
+          sudo ln -sf /usr/bin/llvm-strip-${CLANG_VER} /usr/bin/llvm-strip
+          llvm-ar --version
+          llvm-nm --version
+          llvm-objcopy --version
+          ccache -M ${CCACHE_MAXSIZE}
+          ccache -z
 
-          sel="${IN_TYPE:-Arch Linux ARM}"
-          ui="${IN_UI:-phosh}"
-          size="${IN_SIZE:-6G}"
-          hostname="${IN_HOST:-xaga}"
-          rootpw="${IN_PW:-1234}"
-          if [ -n "$rootpw" ]; then echo "::add-mask::$rootpw"; fi
-          mirror="${IN_MIRROR:-}"
-
-          make_sparse=true
-          if [ "${IN_SPARSE:-true}" != "true" ]; then make_sparse=false; fi
-          install_firmware=true
-          if [ "${IN_FW:-true}" != "true" ]; then install_firmware=false; fi
-
-          # id / release(代号) / title / method / ver(版本号，仅 Ubuntu base 下载用)
-          arch='{"id":"arch","release":"latest","title":"Arch Linux ARM","method":"tarball","ver":""}'
-          deb='{"id":"debian","release":"bookworm","title":"Debian 12","method":"mmdebstrap","ver":"12"}'
-          u2404='{"id":"ubuntu","release":"noble","title":"Ubuntu 24.04 LTS","method":"ubuntu-base","ver":"24.04"}'
-          u2510='{"id":"ubuntu","release":"questing","title":"Ubuntu 25.10","method":"ubuntu-base","ver":"25.10"}'
-          u2604='{"id":"ubuntu","release":"resolute","title":"Ubuntu 26.04 LTS","method":"ubuntu-base","ver":"26.04"}'
-          pmos="{\"id\":\"pmos\",\"release\":\"edge\",\"title\":\"postmarketOS ($ui)\",\"method\":\"pmbootstrap\",\"ver\":\"\"}"
-
-          case "$sel" in
-            all)              inc="$arch,$deb,$u2404,$u2510,$u2604,$pmos" ;;
-            "Arch Linux ARM") inc="$arch" ;;
-            "Debian 12")      inc="$deb" ;;
-            "Ubuntu 24.04 LTS") inc="$u2404" ;;
-            "Ubuntu 25.10")   inc="$u2510" ;;
-            "Ubuntu 26.04 LTS") inc="$u2604" ;;
-            postmarketOS)     inc="$pmos" ;;
-            *) echo "::error::未知的 ROOTFS_TYPE: $sel"; exit 1 ;;
-          esac
-
-          matrix="$(printf '{"include":[%s]}' "$inc" | jq -c .)"
-
-          {
-            echo "matrix=$matrix"
-            echo "size=$size"
-            echo "hostname=$hostname"
-            echo "rootpw=$rootpw"
-            echo "make_sparse=$make_sparse"
-            echo "install_firmware=$install_firmware"
-            echo "extra_packages=${IN_PKGS:-}"
-            echo "mirror=$mirror"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "### 构建计划"
-            echo ""
-            echo "| 系统 | distro/release | 方式 |"
-            echo "|---|---|---|"
-            echo "$matrix" | jq -r '.include[] | "| " + .title + " | `" + .id + "/" + .release + "` | " + .method + " |"'
-            echo ""
-            echo "- 镜像大小: \`$size\` ｜ 主机名: \`$hostname\` ｜ sparse: \`$make_sparse\` ｜ 固件: \`$install_firmware\`"
-            echo "- root 分区: \`${ROOT_PART_MAINLINE:-/dev/mmcblk0p86}\`（主线内核命名，原厂内核为 \`${ROOT_PART_ANDROID:-/dev/sdc86}\`）"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # ---------------------------------------------------------------------------
-  # 2) 构建 rootfs（矩阵）
-  # ---------------------------------------------------------------------------
-  rootfs:
-    name: 构建 ${{ matrix.title }}
-    needs: plan
-    runs-on: ubuntu-24.04
-    timeout-minutes: 150
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
-    env:
-      DISTRO: ${{ matrix.id }}
-      RELEASE: ${{ matrix.release }}
-      CODENAME: ${{ matrix.release }}
-      VER: ${{ matrix.ver }}
-      TITLE: ${{ matrix.title }}
-      METHOD: ${{ matrix.method }}
-      SIZE: ${{ needs.plan.outputs.size }}
-      HOSTNAME: ${{ needs.plan.outputs.hostname }}
-      ROOTPW: ${{ needs.plan.outputs.rootpw }}
-      MAKE_SPARSE: ${{ needs.plan.outputs.make_sparse }}
-      INSTALL_FIRMWARE: ${{ needs.plan.outputs.install_firmware }}
-      EXTRA_PACKAGES: ${{ needs.plan.outputs.extra_packages }}
-      MIRROR: ${{ needs.plan.outputs.mirror }}
-      BUILD_DIR: ${{ runner.temp }}/xaga-build
-      WORKDIR: ${{ runner.temp }}/xaga-build/rootfs
-    steps:
-      - name: 释放磁盘空间
+      - name: 安装 osm0sis mkbootimg
         run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                     /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/lib/jvm 2>/dev/null || true
-          sudo apt-get clean
-          df -h /
+          git clone --depth=1 https://github.com/osm0sis/mkbootimg.git
+          cd mkbootimg
+          sed -i 's/-Werror//g' Makefile libmincrypt/Makefile
+          make
+          sudo cp mkbootimg /usr/local/bin/
+          sudo chmod +x /usr/local/bin/mkbootimg
+          mkbootimg 2>&1 | head -3
 
-      - name: 安装宿主依赖
+      - name: 拉取内核源码
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            qemu-user-static binfmt-support e2fsprogs file \
-            debootstrap mmdebstrap libarchive-tools \
-            android-sdk-libsparse-utils zstd curl wget ca-certificates jq rsync
-          sudo update-binfmts --enable qemu-aarch64 2>/dev/null || true
-          sudo mkdir -p "$BUILD_DIR"
-          sudo rm -rf "$WORKDIR"
-          sudo mkdir -p "$WORKDIR"
-
-      # ---------------- 各发行版 bootstrap ----------------
-      - name: Bootstrap - Arch Linux ARM
-        if: matrix.method == 'tarball'
-        run: |
-          set -euo pipefail
-          URL="http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
-          sudo curl -fsSL -o "$BUILD_DIR/archlinuxarm.tar.gz" "$URL"
-          sudo tar -xpzf "$BUILD_DIR/archlinuxarm.tar.gz" -C "$WORKDIR"
-          sudo rm -f "$BUILD_DIR/archlinuxarm.tar.gz"
-
-      - name: Bootstrap - Debian (mmdebstrap)
-        if: matrix.method == 'mmdebstrap'
-        run: |
-          set -euo pipefail
-          ARGS=(--architectures=arm64 --variant=minbase
-                --components=main,contrib,non-free,non-free-firmware
-                --include=systemd,systemd-sysv,dbus,ca-certificates)
-          if [ -n "$MIRROR" ]; then ARGS+=(--mirror="$MIRROR"); fi
-          if [ "$INSTALL_FIRMWARE" = "true" ]; then
-            ARGS+=(--include=linux-firmware,firmware-mediatek)
-          fi
-          sudo mmdebstrap "${ARGS[@]}" "$CODENAME" "$WORKDIR"
-          sudo du -sh "$WORKDIR"
-
-      - name: Bootstrap - Ubuntu base
-        if: matrix.method == 'ubuntu-base'
-        run: |
-          set -euo pipefail
-          BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${VER}"
-          FILENAME="$(curl -fsSL "$BASE_URL/release/" \
-            | grep -oE "ubuntu-base-${VER}[^\"]*base-arm64\.tar\.gz" | sort -V | tail -1 || true)"
-          if [ -z "$FILENAME" ]; then
-            echo "::error::找不到 Ubuntu ${VER} 的 arm64 base 包（$BASE_URL/release/）"
-            exit 1
-          fi
-          echo "使用: $FILENAME"
-          sudo curl -fsSL -o "$BUILD_DIR/ubuntu-base.tar.gz" "$BASE_URL/release/$FILENAME"
-          sudo tar -xpzf "$BUILD_DIR/ubuntu-base.tar.gz" -C "$WORKDIR"
-          sudo rm -f "$BUILD_DIR/ubuntu-base.tar.gz"
-          # ubuntu-base 不带 apt 源，补上
-          SRC="${MIRROR:-http://ports.ubuntu.com/ubuntu-ports}"
-          sudo tee "$WORKDIR/etc/apt/sources.list" >/dev/null <<EOF
-          deb $SRC $CODENAME main restricted universe multiverse
-          deb $SRC $CODENAME-updates main restricted universe multiverse
-          deb $SRC $CODENAME-security main restricted universe multiverse
-          EOF
-
-      - name: Bootstrap - postmarketOS (pmbootstrap)
-        if: matrix.method == 'pmbootstrap'
-        run: |
-          set -euo pipefail
-          sudo apt-get install -y --no-install-recommends qemu-user-static binfmt-support python3-pip
-          git clone --depth=1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git
-          pip3 install --break-system-packages ./pmbootstrap
-          UI="${{ inputs.PMOS_UI }}"
-          printf '\ngeneric\ngeneric-aarch64\nmainline\n%s\nedge\n\n\n\n\n\n\n\n\n\n' "$UI" | pmbootstrap init
-          pmbootstrap install --no-kernel --filesystem ext4
-          PMOS_IMG=$(ls -t ~/.local/var/pmbootstrap/chroot_native/home/pmos/rootfs/generic-aarch64*.img 2>/dev/null | head -1)
-          if [ -z "$PMOS_IMG" ]; then echo "::error::未找到 pmOS 镜像"; exit 1; fi
-          sudo losetup -P -f "$PMOS_IMG"
-          LOOP_DEV=$(sudo losetup -j "$PMOS_IMG" | cut -d: -f1)
-          sudo mkdir -p "$BUILD_DIR/pmos-mnt"
-          MOUNTED=""
-          for p in "${LOOP_DEV}p2" "${LOOP_DEV}p1" "$LOOP_DEV"; do
-            if [ -e "$p" ] && sudo mount -o ro "$p" "$BUILD_DIR/pmos-mnt"; then MOUNTED="$p"; break; fi
-          done
-          if [ -z "$MOUNTED" ]; then sudo losetup -d "$LOOP_DEV"; echo "::error::pmOS 镜像分区挂载失败"; exit 1; fi
-          echo "已挂载 $MOUNTED"
-          # 统一成目录，后面的配置和打包流程对所有发行版一致
-          sudo rsync -aHAX "$BUILD_DIR/pmos-mnt/" "$WORKDIR/"
-          sudo umount "$BUILD_DIR/pmos-mnt"
-          sudo losetup -d "$LOOP_DEV"
-
-      # ---------------- 通用配置 ----------------
-      - name: 写入基础配置
-        run: |
-          set -euo pipefail
-          echo "$HOSTNAME" | sudo tee "$WORKDIR/etc/hostname" >/dev/null
-          sudo tee "$WORKDIR/etc/hosts" >/dev/null <<EOF
-          127.0.0.1  localhost
-          127.0.1.1  $HOSTNAME
-          ::1        localhost ip6-localhost ip6-loopback
-          ff02::1    ip6-allnodes
-          ff02::2    ip6-allrouters
-          EOF
-          sudo cp -f /etc/resolv.conf "$WORKDIR/etc/resolv.conf"
-          # chroot 里跑 aarch64 程序需要解释器
-          sudo cp -f "$(command -v qemu-aarch64-static)" "$WORKDIR/usr/bin/qemu-aarch64-static"
-
-      - name: chroot 内配置（固件 / 额外包 / root 密码 / init）
-        run: |
-          set -euo pipefail
-          sudo mkdir -p "$WORKDIR/proc" "$WORKDIR/sys" "$WORKDIR/dev"
-          sudo mount -t proc proc "$WORKDIR/proc"
-          sudo mount -t sysfs sysfs "$WORKDIR/sys"
-          sudo mount --bind /dev "$WORKDIR/dev"
-          sudo mount --bind /dev/pts "$WORKDIR/dev/pts" 2>/dev/null || true
-
-          run() { sudo chroot "$WORKDIR" /bin/sh -c "$1"; }
-
-          FW=''
-          SYSINIT=''
-          case "$DISTRO" in
-            arch)
-              UPDATE='pacman-key --init; pacman-key --populate archlinuxarm; pacman -Sy'
-              INSTALL='pacman -S --noconfirm --needed'
-              FW='linux-firmware linux-firmware-whence'
-              SYSINIT='systemd systemd-sysvcompat'
-              ;;
-            debian)
-              UPDATE='apt-get update'
-              INSTALL='apt-get install -y --no-install-recommends'
-              FW='linux-firmware firmware-mediatek'
-              SYSINIT='systemd systemd-sysv'
-              ;;
-            ubuntu)
-              UPDATE='apt-get update'
-              INSTALL='apt-get install -y --no-install-recommends'
-              FW='linux-firmware'
-              SYSINIT='systemd systemd-sysv'
-              ;;
-            pmos)
-              UPDATE='apk update'
-              INSTALL='apk add --no-cache'
-              FW='linux-firmware-mediatek linux-firmware-other'
-              SYSINIT=''
-              ;;
-          esac
-
-          # 固件必须单独安装：整组失败时逐个重试。
-          # 不能和 systemd / 额外包混在一条 install 里 —— 只要其中一个包名在当前
-          # 源里不存在，整条命令就全部失败，结果固件和 /sbin/init 都没装上，开不了机。
-          if [ "$INSTALL_FIRMWARE" = "true" ] && [ -n "$FW" ]; then
-            run "$UPDATE" || echo "::warning::更新软件源失败，继续尝试安装"
-            if ! run "$INSTALL $FW"; then
-              echo "::warning::固件整组安装失败（$FW），改为逐个尝试"
-              fw_ok=0
-              for p in $FW; do
-                if run "$INSTALL $p"; then
-                  fw_ok=1
-                else
-                  echo "::warning::固件包 $p 安装失败"
-                fi
-              done
-              if [ "$fw_ok" = "0" ]; then
-                echo "::warning::所有固件包都装不上 —— 开机后 WiFi/蓝牙/声卡/触控会失效，需手动补装"
-              fi
-            fi
+          git clone -b ${{ env.KERNEL_BRANCH }} https://github.com/${{ env.KERNEL_REPO }}.git kernel
+          cd kernel
+          if [ -n "${{ inputs.KERNEL_COMMIT }}" ]; then
+            git fetch origin
+            git checkout ${{ inputs.KERNEL_COMMIT }}
           fi
 
-          PKGS=""
-          if [ ! -e "$WORKDIR/sbin/init" ] && [ -n "$SYSINIT" ]; then PKGS="$SYSINIT"; fi
-          if [ -n "$EXTRA_PACKAGES" ]; then PKGS="$PKGS $EXTRA_PACKAGES"; fi
-
-          if [ -n "$PKGS" ]; then
-            run "$UPDATE" || echo "::warning::更新软件源失败，继续尝试安装"
-            if ! run "$INSTALL $PKGS"; then
-              echo "::warning::以下包安装失败: $PKGS —— 若含 systemd，/sbin/init 会缺失导致无法启动"
-            fi
-          fi
-
-          # root 密码
-          if ! run "echo 'root:${ROOTPW}' | chpasswd"; then
-            run "printf '%s\n%s\n' '${ROOTPW}' '${ROOTPW}' | passwd root" \
-              || echo "::warning::设置 root 密码失败"
-          fi
-
-          # 主机名（部分发行版 bootstrap 之后会覆盖）
-          run "echo '${HOSTNAME}' > /etc/hostname"
-
-          # systemd 发行版开个网络/ssh，方便首次开机就能连
-          if [ "$DISTRO" != "pmos" ]; then
-            run "systemctl enable systemd-networkd 2>/dev/null; systemctl enable systemd-resolved 2>/dev/null; true"
-            run "systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true"
-          else
-            run "rc-update add sshd default 2>/dev/null || true"
-          fi
-
-          # 别把 qemu 解释器打进镜像
-          sudo rm -f "$WORKDIR/usr/bin/qemu-aarch64-static"
-
-      - name: 卸载 chroot 挂载
-        if: always()
+      - name: 生成 .config（defconfig + xaga fragment + 关冲突项）
+        working-directory: kernel
         run: |
-          sudo rm -f "$WORKDIR/usr/bin/qemu-aarch64-static" 2>/dev/null || true
-          sudo umount -lf "$WORKDIR/dev/pts" 2>/dev/null || true
-          sudo umount -lf "$WORKDIR/dev" 2>/dev/null || true
-          sudo umount -lf "$WORKDIR/sys" 2>/dev/null || true
-          sudo umount -lf "$WORKDIR/proc" 2>/dev/null || true
+          export ARCH=arm64
+          scripts/kconfig/merge_config.sh \
+            arch/arm64/configs/defconfig \
+            arch/arm64/configs/xaga.config
 
-      # ---------------- 打包 ----------------
-      - name: 打包 ext4 镜像（mkfs.ext4 -d，不用 loop）
+          # MT8183 等无关联发科 ASoC 与 common/mtk-base-afe.h 枚举重定义，必挂
+          scripts/config \
+            --disable CONFIG_SND_SOC_MT8183 \
+            --disable CONFIG_SND_SOC_MT8183_MT6358_TS3A227E_MAX98357A \
+            --disable CONFIG_SND_SOC_MT8183_DA7219_MAX98357A \
+            --disable CONFIG_SND_SOC_MT8188 \
+            --disable CONFIG_SND_SOC_MT8188_MT6359 \
+            --disable CONFIG_SND_SOC_MT8192 \
+            --disable CONFIG_SND_SOC_MT8192_MT6359_RT1015_RT5682 \
+            --disable CONFIG_SND_SOC_MT8195 \
+            --disable CONFIG_SND_SOC_MT8195_MT6359 \
+            --disable CONFIG_SND_SOC_MT8365 \
+            --disable CONFIG_SND_SOC_MT8365_MT6357 \
+            --disable CONFIG_SND_SOC_SOF_MT8186 \
+            --disable CONFIG_SND_SOC_SOF_MT8195
+
+          # 首次构建先关 Rust（需要 rustc 1.85+ / bindgen 0.71+）
+          scripts/config --disable CONFIG_RUST
+          scripts/config --disable CONFIG_DRM_PANIC_SCREEN_QR_CODE
+          scripts/config --set-str CONFIG_DRM_PANIC_SCREEN "kmsg"
+
+          # 关掉 WERROR，避免驱动警告升级成错误
+          scripts/config --disable CONFIG_WERROR
+
+          # rootfs 侧要用（镜像处理 / f2fs）
+          scripts/config --set-val CONFIG_BLK_DEV_LOOP y
+          scripts/config --set-val CONFIG_F2FS_FS y
+          scripts/config --set-val CONFIG_F2FS_FS_SECURITY y
+
+          make LLVM=1 ARCH=arm64 olddefconfig
+          grep -E '^#? ?CONFIG_RUST$|CONFIG_DRM_PANIC_SCREEN|CONFIG_SND_SOC_MT(6895|8183)' .config || true
+
+      - name: 全 LLVM 编译内核 + 模块
+        working-directory: kernel
         run: |
-          set -euo pipefail
-          IMG="$BUILD_DIR/xaga-rootfs-${DISTRO}-${RELEASE}.img"
-          echo "IMG=$IMG" >> "$GITHUB_ENV"
+          make -j$(nproc) ARCH=arm64 \
+            CC=clang-${{ inputs.CLANG_VERSION }} \
+            LD=ld.lld-${{ inputs.CLANG_VERSION }} \
+            LLVM=1 LLVM_IAS=1 \
+            Image.gz modules
 
-          used=$(sudo du -sm "$WORKDIR" | cut -f1)
-          cap_mb=$(( $(numfmt --from=iec "$SIZE") / 1048576 ))
-          echo "rootfs 内容 ${used}MB / 镜像容量 ${cap_mb}MB"
-          if [ "$used" -ge "$cap_mb" ]; then
-            echo "::error::内容 ${used}MB 装不进 $SIZE 的镜像，请调大 SIZE"
-            exit 1
-          fi
-          if [ "$used" -gt $(( cap_mb * 85 / 100 )) ]; then
-            echo "::warning::内容已占镜像 $(( used * 100 / cap_mb ))%，建议调大 SIZE"
-          fi
-
-          truncate -s "$SIZE" "$IMG"
-          sudo mkfs.ext4 -F -d "$WORKDIR" -L "${HOSTNAME}-rootfs" -b 4096 "$IMG"
-          sudo e2fsck -fn "$IMG" || { echo "::error::e2fsck 报告文件系统错误"; exit 1; }
-          sudo dumpe2fs -h "$IMG" | grep -E 'Filesystem volume name|Filesystem magic number|Filesystem features' || true
-          df -h /
-
-      - name: 生成 sparse 镜像
-        if: needs.plan.outputs.make_sparse == 'true'
+      - name: 校验 DTB 是否链进 vmlinux
+        working-directory: kernel
         run: |
-          set -euo pipefail
-          SPARSE="${IMG%.img}-sparse.img"
-          img2simg "$IMG" "$SPARSE"
-          simg2img "$SPARSE" "$BUILD_DIR/roundtrip.img"
-          rt=$(stat -c%s "$BUILD_DIR/roundtrip.img")
-          or=$(stat -c%s "$IMG")
-          rm -f "$BUILD_DIR/roundtrip.img"
-          if [ "$rt" != "$or" ]; then
-            echo "::error::sparse 往返后大小不一致: $rt != $or"
-            exit 1
-          fi
-          ls -lh "$IMG" "$SPARSE"
+          nm vmlinux | grep mt6895_xiaomi_xaga_dtb_start \
+            || { echo "::error::DTB 没链进 vmlinux，刷上去必挂"; exit 1; }
+          ls -lh arch/arm64/boot/Image.gz arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb
 
-      # ---------------- 校验 ----------------
-      - name: 校验
+      - name: 输出内核版本
+        id: kver
+        working-directory: kernel
+        run: echo "kver=$(make -s ARCH=arm64 kernelrelease)" >> $GITHUB_OUTPUT
+
+      - name: 安装并打包内核模块
+        working-directory: kernel
         run: |
-          set -euo pipefail
-          fail() { echo "::error::$*"; exit 1; }
+          mkdir -p ${{ github.workspace }}/mods
+          make -j$(nproc) ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CC=clang-${{ inputs.CLANG_VERSION }} \
+            modules_install \
+            INSTALL_MOD_PATH=${{ github.workspace }}/mods \
+            INSTALL_MOD_STRIP=1 \
+            DEPMOD=true
+          cd ${{ github.workspace }}/mods
+          tar -czf ${{ github.workspace }}/xaga-modules.tar.gz lib
+          ls -lh ${{ github.workspace }}/xaga-modules.tar.gz
 
-          echo "::group::文件系统必须是 ext4"
-          magic=$(sudo dumpe2fs -h "$IMG" | awk -F': ' '/Filesystem magic number/{print $2}')
-          echo "magic=$magic"
-          [ "$magic" = "0xEF53" ] || fail "不是 ext4（BOOT_PARTITION 只认 ext4）"
-          act=$(stat -c%s "$IMG"); exp=$(numfmt --from=iec "$SIZE")
-          [ "$act" -le "$exp" ] || fail "镜像 $act 超过 -s $SIZE"
-          echo "大小 $act / 上限 $exp: OK"
-          echo "::endgroup::"
-
-          echo "::group::/sbin/init（initramfs pivot 后直接 execve 它）"
-          target=$(sudo readlink -f "$WORKDIR/sbin/init" 2>/dev/null || true)
-          echo "/sbin/init => ${target:-<不存在>}"
-          [ -n "$target" ] || fail "镜像里没有 /sbin/init，开机必黑屏"
-          [ -x "$target" ] || fail "$target 不可执行"
-          if [ "$DISTRO" = "pmos" ]; then
-            echo "pmOS 使用 openrc: OK"
-          else
-            case "$target" in
-              *systemd*) echo "指向 systemd: OK" ;;
-              *) fail "/sbin/init 未指向 systemd（$target）" ;;
-            esac
-          fi
-          echo "::endgroup::"
-
-          echo "::group::主机名 / root 密码"
-          hh=$(sudo cat "$WORKDIR/etc/hostname" 2>/dev/null || true)
-          [ "$hh" = "$HOSTNAME" ] || fail "主机名是 '$hh'，期望 '$HOSTNAME'"
-          if sudo grep -qE '^root:\$.+' "$WORKDIR/etc/shadow"; then
-            echo "root 密码已写入: OK"
-          else
-            fail "/etc/shadow 里没有 root 密码"
-          fi
-          echo "::endgroup::"
-
-          echo "::group::aarch64 用户态冒烟（qemu-user）"
-          if [ "$DISTRO" = "pmos" ]; then
-            sudo qemu-aarch64-static -L "$WORKDIR" "$WORKDIR/sbin/init" --version \
-              || echo "::warning::openrc 未输出版本（不影响使用）"
-          else
-            SD=$(sudo readlink -f "$WORKDIR/lib/systemd/systemd" 2>/dev/null \
-                 || sudo readlink -f "$WORKDIR/usr/lib/systemd/systemd" 2>/dev/null || true)
-            [ -n "$SD" ] || fail "找不到 systemd 可执行文件"
-            sudo qemu-aarch64-static -L "$WORKDIR" "$SD" --version \
-              || fail "qemu 无法执行 $SD（架构或动态库有问题）"
-          fi
-          echo "::endgroup::"
-
-          echo "::group::固件（WiFi/蓝牙/声卡/触控依赖 mediatek 固件）"
-          fwdir=""
-          for d in "$WORKDIR/lib/firmware/mediatek" "$WORKDIR/usr/lib/firmware/mediatek"; do
-            if [ -d "$d" ]; then fwdir="$d"; fi
-          done
-          if [ -n "$fwdir" ]; then
-            n=$(sudo find "$fwdir" -type f | wc -l | tr -d ' ')
-            sz=$(sudo du -sh "$fwdir" 2>/dev/null | cut -f1)
-            if [ "$n" -eq 0 ]; then
-              echo "::warning::$fwdir 存在但里面没有文件 —— WiFi、蓝牙、声卡、触控会失效，开机后请手动补装"
-            else
-              echo "mediatek 固件: $n 个文件，共 ${sz:-未知} —— 已安装"
-              sudo find "$fwdir" -type f | head -8 | sed "s|.*/mediatek/|  mediatek/|"
-            fi
-          else
-            echo "::warning::没有 /lib/firmware/mediatek —— WiFi、蓝牙、声卡、触控会失效，开机后请手动补装"
-          fi
-          echo "::endgroup::"
-
-      - name: 压缩并生成校验值
-        run: |
-          set -euo pipefail
-          sudo chown -R "$(id -u):$(id -g)" "$BUILD_DIR" 2>/dev/null || true
-          cd "$BUILD_DIR"
-          base="xaga-rootfs-${DISTRO}-${RELEASE}"
-          files=("$base.img")
-          if [ -f "$base-sparse.img" ]; then files+=("$base-sparse.img"); fi
-          sha256sum "${files[@]}" > "SHA256SUMS-$base.txt"
-          # -S 保留稀疏属性，下载后 tar -xS 仍是稀疏文件
-          tar -cSf - "${files[@]}" | zstd -T0 -12 -o "$base.tar.zst"
-          sha256sum "$base.tar.zst" >> "SHA256SUMS-$base.txt"
-          ls -lh "$base.tar.zst"
-          {
-            echo "### $TITLE —— $base"
-            echo '```'
-            cat "SHA256SUMS-$base.txt"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 上传 RootFS 产物
+      - name: 上传内核模块
         uses: actions/upload-artifact@v4
         with:
-          name: xaga-rootfs-${{ matrix.id }}-${{ matrix.release }}
-          path: |
-            ${{ env.BUILD_DIR }}/xaga-rootfs-*.tar.zst
-            ${{ env.BUILD_DIR }}/SHA256SUMS-*.txt
-          retention-days: 7
+          name: xaga-modules
+          path: xaga-modules.tar.gz
           if-no-files-found: error
 
-      - name: 清理
-        if: always()
+      - name: 构建 initramfs（物理分区版）
         run: |
-          sudo rm -rf "$WORKDIR" 2>/dev/null || true
-          df -h /
+          git clone https://github.com/${{ env.INITRAMFS_REPO }}.git initramfs
+          cd initramfs
+          if [ -n "${{ inputs.INITRAMFS_COMMIT }}" ]; then
+            git fetch origin
+            git checkout ${{ inputs.INITRAMFS_COMMIT }}
+          fi
+          sudo apt install -y --no-install-recommends gcc-aarch64-linux-gnu lz4
+          make clean
+          make CROSS=aarch64-linux-gnu- BOOT_PARTITION=${{ inputs.ROOT_PART }}
+          cp initramfs.cpio.lz4 ../initramfs-physical.cpio.lz4
 
-  # ---------------------------------------------------------------------------
-  # 3) 通知
-  # ---------------------------------------------------------------------------
+      - name: 打包 boot.img
+        run: |
+          cd kernel
+          cat arch/arm64/boot/${{ inputs.KERNEL_IMAGE }} \
+              arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb > Image_with_dtb
+          hexdump -C Image_with_dtb | grep d00dfeed
+          MEM_ARG=""
+          if [ -n "${{ inputs.MEM_LIMIT }}" ]; then
+            MEM_ARG="mem=${{ inputs.MEM_LIMIT }}"
+          fi
+          mkbootimg \
+            --kernel Image_with_dtb \
+            --ramdisk ../initramfs-physical.cpio.lz4 \
+            --cmdline "earlycon=0x11200000,115200 root=${{ inputs.ROOT_PART }} rootfstype=ext4 loglevel=7 ${MEM_ARG}" \
+            -o ../boot-arch.img
+          ls -lh ../boot-arch.img
+
+      - name: 上传 boot 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: xaga-boot
+          path: |
+            boot-arch.img
+            kernel/Image_with_dtb
+            initramfs-physical.cpio.lz4
+          if-no-files-found: error
+
+  # ==========================================================
+  # Job 2：构建 Arch Linux ARM rootfs（注入内核模块）
+  # ==========================================================
+  arch-rootfs:
+    name: 构建 Arch Linux ARM rootfs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: kernel
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt update -y
+          sudo apt install -y --no-install-recommends \
+            wget curl git e2fsprogs util-linux libarchive-tools \
+            qemu-user-static binfmt-support android-sdk-libsparse-utils
+
+      - name: 注册 aarch64 binfmt（chroot 里跑 pacman 需要）
+        run: |
+          sudo update-binfmts --enable qemu-aarch64 || true
+          if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            sudo mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc || true
+            sudo update-binfmts --enable qemu-aarch64 || true
+          fi
+          if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            echo "::warning::binfmt 仍不可用，尝试 docker multiarch 兜底"
+            docker run --privileged --rm multiarch/qemu-user-static --reset -p yes || true
+          fi
+          ls /proc/sys/fs/binfmt_misc/ || true
+
+      - name: 下载并解压 Arch Linux ARM aarch64
+        run: |
+          wget -q --show-progress -O ArchLinuxARM-aarch64.tar.gz \
+            http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+          mkdir -p rootfs
+          # bsdtar 保住 xattr / capabilities；普通 tar 会丢，ping、sudo 这类会失效
+          sudo bsdtar -xpf ArchLinuxARM-aarch64.tar.gz -C rootfs
+
+      - name: 下载内核模块
+        uses: actions/download-artifact@v4
+        with:
+          name: xaga-modules
+          path: mods
+
+      - name: 注入内核模块
+        run: |
+          sudo tar -xzf mods/xaga-modules.tar.gz -C rootfs
+          ls -lh rootfs/lib/modules/
+          echo "${{ needs.kernel.outputs.kver }}" | sudo tee rootfs/kver.txt > /dev/null
+
+      - name: 写 rootfs 基础配置
+        run: |
+          printf 'xaga\n' | sudo tee rootfs/etc/hostname > /dev/null
+          sudo tee rootfs/etc/hosts > /dev/null <<'EOF'
+          127.0.0.1       localhost
+          127.0.1.1       xaga
+          ::1             localhost ip6-localhost ip6-loopback
+          EOF
+          # init.c 硬编码 ext4 挂载，root 必须指向物理分区
+          sudo tee rootfs/etc/fstab > /dev/null <<'EOF'
+          # <device>  <mount>  <type>  <options>                          <dump> <pass>
+          ${{ inputs.ROOT_PART }}  /  ext4  defaults,noatime,errors=remount-ro  0  1
+          EOF
+          cat rootfs/etc/fstab
+          printf 'root:%s\n' '${{ inputs.ROOT_PASSWORD }}' | sudo tee rootfs/rootpw.txt > /dev/null
+          sudo chmod 600 rootfs/rootpw.txt
+
+      - name: chroot 配置系统
+        run: |
+          sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
+          sudo rm -f rootfs/etc/resolv.conf
+          sudo cp /etc/resolv.conf rootfs/etc/resolv.conf
+          sudo mkdir -p rootfs/proc rootfs/sys
+          sudo mount -t proc  proc  rootfs/proc || true
+          sudo mount -t sysfs sysfs rootfs/sys  || true
+
+          sudo chroot rootfs /bin/bash -c '
+          set -e
+          pacman-key --init
+          pacman-key --populate archlinuxarm
+          # 先刷 keyring，老 tarball 直接 -Syu 会报签名失败
+          pacman -Sy --noconfirm archlinuxarm-keyring || true
+          pacman -Sy --noconfirm archlinux-keyring || true
+          # 去掉 tarball 自带内核，用我们自己编的
+          pacman -Rdd --noconfirm linux-aarch64 || true
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed ${{ inputs.EXTRA_PACKAGES }}
+          pacman -S --noconfirm --needed ${{ inputs.FIRMWARE_PACKAGE }} \
+            || echo "::warning::${{ inputs.FIRMWARE_PACKAGE }} 不可用，WiFi/触控可能没固件"
+
+          sed -i "s/^#\?PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
+          sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
+          ssh-keygen -A
+
+          systemctl enable NetworkManager || true
+          systemctl enable sshd || true
+          systemctl enable systemd-resolved || true
+          systemctl enable getty@tty1 || true
+
+          chpasswd < /rootpw.txt
+          rm -f /rootpw.txt
+          ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+          depmod -a "$(cat /kver.txt)"
+          rm -f /kver.txt
+          pacman -Scc --noconfirm || true
+          '
+
+      - name: 清理并校验关键项
+        run: |
+          sudo umount -lf rootfs/proc || true
+          sudo umount -lf rootfs/sys  || true
+          sudo rm -f rootfs/usr/bin/qemu-aarch64-static
+          sudo rm -f rootfs/rootpw.txt rootfs/kver.txt
+
+          # init.c 写死 execve("/sbin/init")，缺了就是开机黑屏死循环
+          if [ ! -e rootfs/sbin/init ] && [ -e rootfs/usr/lib/systemd/systemd ]; then
+            echo "::warning::/sbin/init 缺失，补一个到 systemd 的软链接"
+            sudo mkdir -p rootfs/sbin
+            sudo ln -sf /usr/lib/systemd/systemd rootfs/sbin/init
+          fi
+          test -e rootfs/sbin/init || { echo "::error::rootfs 里没有 /sbin/init"; exit 1; }
+
+          # 服务没 enable 起来，第一次开机就没网没 ssh
+          test -e rootfs/etc/systemd/system/multi-user.target.wants/sshd.service \
+            || echo "::warning::sshd 未开机自启"
+          test -e rootfs/etc/systemd/system/multi-user.target.wants/NetworkManager.service \
+            || echo "::warning::NetworkManager 未开机自启"
+
+          ls -l rootfs/sbin/init
+          ls -l rootfs/lib/modules/
+
+      - name: 打包 ext4 镜像（不使用 loop 设备）
+        run: |
+          truncate -s ${{ inputs.ROOTFS_SIZE }} rootfs.img
+          sudo mkfs.ext4 -F -L xaga-root -d rootfs rootfs.img
+          sudo e2fsck -fy rootfs.img || true
+          img2simg rootfs.img rootfs-sparse.img
+          ls -lh rootfs.img rootfs-sparse.img
+
+      - name: 上传 rootfs 产物（sparse）
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-rootfs
+          path: rootfs-sparse.img
+          if-no-files-found: error
+
+      - name: 上传原始 rootfs.img
+        if: ${{ inputs.UPLOAD_RAW_IMG }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-rootfs-raw
+          path: rootfs.img
+          if-no-files-found: error
+
+  # ==========================================================
+  # Job 3：构建通知
+  # ==========================================================
   notify:
     name: 发送构建通知
     runs-on: ubuntu-latest
-    needs: [plan, rootfs]
+    needs: [kernel, arch-rootfs]
     if: ${{ always() && inputs.ENABLE_NOTIFY }}
     steps:
       - name: Checkout 本仓库
         uses: actions/checkout@v5
 
-      - name: 判定整体构建状态
+      - name: 判定整体状态
         id: status
         run: |
-          R="${{ needs.rootfs.result }}"
-          if [ "$R" = "failure" ] || [ "$R" = "cancelled" ]; then
-            echo "result=failure" >> "$GITHUB_OUTPUT"
-          else
-            echo "result=success" >> "$GITHUB_OUTPUT"
-          fi
+          overall="success"
+          for r in "${{ needs.kernel.result }}" "${{ needs.arch-rootfs.result }}"; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              overall="failure"
+            fi
+          done
+          echo "result=${overall}" >> $GITHUB_OUTPUT
 
-      - name: 调用 bot.py 发送通知
+      - name: 调用 bot.py
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
         run: |
           pip3 install --quiet requests 2>/dev/null || true
+          if [ -f bot.py ]; then
+            PY=bot.py
+          elif [ -f .github/bot.py ]; then
+            PY=.github/bot.py
+          else
+            echo "未找到 bot.py，跳过通知"
+            exit 0
+          fi
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          # 注意: bot.py 在 .github/ 下，不是仓库根目录
-          python3 .github/bot.py --notify \
+          python3 "$PY" --notify \
             --status ${{ steps.status.outputs.result }} \
             --artifact-url "$RUN_URL"
-
-      - name: 刷机提示
-        run: |
-          {
-            echo "## 刷机提示"
-            echo ""
-            echo '```bash'
-            echo '# 1) 确认当前槽位，刷到对应的 boot_a / boot_b'
-            echo 'fastboot getvar current-slot'
-            echo 'fastboot flash boot_a boot-physical.img   # 或 boot_b'
-            echo ''
-            echo '# 2) 刷 rootfs（会清空内置存储，务必先备份）'
-            echo 'fastboot flash userdata xaga-rootfs-<id>-<release>-sparse.img'
-            echo ''
-            echo '# 备选: 进 initramfs 的 adb，手动格式化再解包（不依赖 sparse）'
-            echo '#   mkfs.ext4 -F /dev/mmcblk0p86 && mount /dev/mmcblk0p86 /mnt'
-            echo '#   tar -xpf rootfs.tar -C /mnt'
-            echo ''
-            echo '# 3) 开机后扩到整个 userdata 分区'
-            echo 'resize2fs /dev/mmcblk0p86'
-            echo '```'
-            echo ""
-            echo "> MTK 的 v4 boot header 不支持 \`fastboot boot\`，别用它临时启动验证；"
-            echo "> 直接 flash 对应槽位后重启。设备是 6+128 时记得 cmdline 带 \`mem=6G\`。"
-          } >> "$GITHUB_STEP_SUMMARY"
