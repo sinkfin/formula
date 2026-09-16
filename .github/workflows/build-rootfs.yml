@@ -97,8 +97,8 @@ env:
   ROOT_PART_MAINLINE: "/dev/mmcblk0p86"
   ROOT_PART_ANDROID: "/dev/sdc86"
   NVDATA_PART: "/dev/sdc13"        # WiFi NVRAM，只读 ext4
-  BUILD_DIR: ${{ runner.temp }}/xaga-build
-  WORKDIR: ${{ runner.temp }}/xaga-build/rootfs
+  # 注意: runner 上下文在 workflow 级 env 里不可用，会报
+  # "Unrecognized named-value: 'runner'" —— 路径类变量必须下放到 job 级 env
   DEBIAN_FRONTEND: noninteractive
 
 jobs:
@@ -214,6 +214,8 @@ jobs:
       INSTALL_FIRMWARE: ${{ needs.plan.outputs.install_firmware }}
       EXTRA_PACKAGES: ${{ needs.plan.outputs.extra_packages }}
       MIRROR: ${{ needs.plan.outputs.mirror }}
+      BUILD_DIR: ${{ runner.temp }}/xaga-build
+      WORKDIR: ${{ runner.temp }}/xaga-build/rootfs
     steps:
       - name: 释放磁盘空间
         run: |
@@ -335,6 +337,8 @@ jobs:
 
           run() { sudo chroot "$WORKDIR" /bin/sh -c "$1"; }
 
+          FW=''
+          SYSINIT=''
           case "$DISTRO" in
             arch)
               UPDATE='pacman-key --init; pacman-key --populate archlinuxarm; pacman -Sy'
@@ -362,15 +366,35 @@ jobs:
               ;;
           esac
 
+          # 固件必须单独安装：整组失败时逐个重试。
+          # 不能和 systemd / 额外包混在一条 install 里 —— 只要其中一个包名在当前
+          # 源里不存在，整条命令就全部失败，结果固件和 /sbin/init 都没装上，开不了机。
+          if [ "$INSTALL_FIRMWARE" = "true" ] && [ -n "$FW" ]; then
+            run "$UPDATE" || echo "::warning::更新软件源失败，继续尝试安装"
+            if ! run "$INSTALL $FW"; then
+              echo "::warning::固件整组安装失败（$FW），改为逐个尝试"
+              fw_ok=0
+              for p in $FW; do
+                if run "$INSTALL $p"; then
+                  fw_ok=1
+                else
+                  echo "::warning::固件包 $p 安装失败"
+                fi
+              done
+              if [ "$fw_ok" = "0" ]; then
+                echo "::warning::所有固件包都装不上 —— 开机后 WiFi/蓝牙/声卡/触控会失效，需手动补装"
+              fi
+            fi
+          fi
+
           PKGS=""
-          if [ "$INSTALL_FIRMWARE" = "true" ]; then PKGS="$FW"; fi
-          if [ ! -e "$WORKDIR/sbin/init" ] && [ -n "$SYSINIT" ]; then PKGS="$PKGS $SYSINIT"; fi
+          if [ ! -e "$WORKDIR/sbin/init" ] && [ -n "$SYSINIT" ]; then PKGS="$SYSINIT"; fi
           if [ -n "$EXTRA_PACKAGES" ]; then PKGS="$PKGS $EXTRA_PACKAGES"; fi
 
           if [ -n "$PKGS" ]; then
             run "$UPDATE" || echo "::warning::更新软件源失败，继续尝试安装"
             if ! run "$INSTALL $PKGS"; then
-              echo "::warning::以下包安装失败: $PKGS —— 开机后请手动补装（尤其是固件）"
+              echo "::warning::以下包安装失败: $PKGS —— 若含 systemd，/sbin/init 会缺失导致无法启动"
             fi
           fi
 
@@ -497,8 +521,19 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::固件（WiFi/蓝牙/声卡/触控依赖 mediatek 固件）"
-          if [ -d "$WORKDIR/lib/firmware/mediatek" ] || [ -d "$WORKDIR/usr/lib/firmware/mediatek" ]; then
-            echo "mediatek 固件: 已安装"
+          fwdir=""
+          for d in "$WORKDIR/lib/firmware/mediatek" "$WORKDIR/usr/lib/firmware/mediatek"; do
+            if [ -d "$d" ]; then fwdir="$d"; fi
+          done
+          if [ -n "$fwdir" ]; then
+            n=$(sudo find "$fwdir" -type f | wc -l | tr -d ' ')
+            sz=$(sudo du -sh "$fwdir" 2>/dev/null | cut -f1)
+            if [ "$n" -eq 0 ]; then
+              echo "::warning::$fwdir 存在但里面没有文件 —— WiFi、蓝牙、声卡、触控会失效，开机后请手动补装"
+            else
+              echo "mediatek 固件: $n 个文件，共 ${sz:-未知} —— 已安装"
+              sudo find "$fwdir" -type f | head -8 | sed "s|.*/mediatek/|  mediatek/|"
+            fi
           else
             echo "::warning::没有 /lib/firmware/mediatek —— WiFi、蓝牙、声卡、触控会失效，开机后请手动补装"
           fi
