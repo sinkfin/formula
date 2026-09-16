@@ -1,0 +1,483 @@
+name: 构建 xaga rootfs 镜像
+
+# =============================================================================
+# xaga (MT6895 / 天玑8100) mainline —— ext4 rootfs 镜像 CI
+#
+# 产物:  xaga-rootfs-<distro>-<release>.tar.zst
+#          ├── xaga-rootfs-<distro>-<release>.img          (ext4, 可 fastboot flash)
+#          └── xaga-rootfs-<distro>-<release>-sparse.img   (sparse, 传输快)
+#
+# 触发方式见 docs/CI.md
+# =============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      distro:
+        description: '发行版(all = 全矩阵)'
+        type: choice
+        default: 'all'
+        options: [all, arch, debian, ubuntu]
+      release:
+        description: '版本代号，逗号分隔可多版本(留空=该发行版默认)'
+        default: ''
+      size:
+        description: '镜像大小'
+        default: '6G'
+      hostname:
+        description: '主机名'
+        default: 'xaga'
+      with_kernel:
+        description: '同时编译内核并把模块装进 rootfs'
+        type: boolean
+        default: false
+      kernel_repo:
+        description: '内核源码仓库(留空用仓库变量 KERNEL_REPO)'
+        default: ''
+      kernel_ref:
+        description: '内核分支 / tag(留空用变量 KERNEL_REF)'
+        default: ''
+      kernel_defconfig:
+        description: 'defconfig 名称(留空用变量 KERNEL_DEFCONFIG)'
+        default: ''
+      retention_days:
+        description: '产物保留天数'
+        default: '7'
+
+  # main 分支上脚本或本工作流变更 -> 只跑 Debian 冒烟，省机器
+  push:
+    branches: [main]
+    paths:
+      - 'make-rootfs.sh'
+      - '.github/workflows/build-rootfs.yml'
+
+  # 每周二 02:00 (UTC+8) 全量构建
+  schedule:
+    - cron: '0 18 * * 1'
+
+concurrency:
+  group: build-rootfs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # 所有中间产物放 runner.temp，避免污染 checkout
+  BUILD_DIR: ${{ runner.temp }}/xaga-build
+  WORKDIR: ${{ runner.temp }}/xaga-build/rootfs-dir
+  KSTUB: ${{ runner.temp }}/xaga-build/kernel-stub
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) 计算构建矩阵 + 内核参数
+  # ---------------------------------------------------------------------------
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      with_kernel: ${{ steps.gen.outputs.with_kernel }}
+      kernel_repo: ${{ steps.gen.outputs.kernel_repo }}
+      kernel_ref: ${{ steps.gen.outputs.kernel_ref }}
+      kernel_defconfig: ${{ steps.gen.outputs.kernel_defconfig }}
+      size: ${{ steps.gen.outputs.size }}
+      hostname: ${{ steps.gen.outputs.hostname }}
+      retention_days: ${{ steps.gen.outputs.retention_days }}
+    env:
+      IN_DISTRO: ${{ github.event.inputs.distro }}
+      IN_RELEASE: ${{ github.event.inputs.release }}
+      IN_SIZE: ${{ github.event.inputs.size }}
+      IN_HOSTNAME: ${{ github.event.inputs.hostname }}
+      IN_WITH_KERNEL: ${{ github.event.inputs.with_kernel }}
+      IN_KERNEL_REPO: ${{ github.event.inputs.kernel_repo }}
+      IN_KERNEL_REF: ${{ github.event.inputs.kernel_ref }}
+      IN_KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig }}
+      IN_RETENTION: ${{ github.event.inputs.retention_days }}
+      VAR_KERNEL_REPO: ${{ vars.KERNEL_REPO }}
+      VAR_KERNEL_REF: ${{ vars.KERNEL_REF }}
+      VAR_KERNEL_DEFCONFIG: ${{ vars.KERNEL_DEFCONFIG }}
+    steps:
+      - name: 生成矩阵
+        id: gen
+        run: |
+          set -euo pipefail
+
+          # push 只做 Debian 冒烟；schedule / 手动派发走用户选择
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            sel=debian
+          else
+            sel="${IN_DISTRO:-all}"
+          fi
+
+          size="${IN_SIZE:-6G}"
+          hostname="${IN_HOSTNAME:-xaga}"
+          retention="${IN_RETENTION:-7}"
+
+          default_rel() {
+            case "$1" in
+              arch) echo latest ;;
+              debian) echo bookworm ;;
+              ubuntu) echo noble ;;
+            esac
+          }
+
+          if [ "$sel" = "all" ]; then
+            matrix='{"include":[
+              {"distro":"arch","release":"latest"},
+              {"distro":"debian","release":"bookworm"},
+              {"distro":"debian","release":"trixie"},
+              {"distro":"ubuntu","release":"noble"},
+              {"distro":"ubuntu","release":"resolute"}
+            ]}'
+          else
+            rel="${IN_RELEASE:-$(default_rel "$sel")}"
+            # 支持 "bookworm,trixie" 逗号分隔
+            inc=""
+            IFS=',' read -ra rels <<< "$rel"
+            for r in "${rels[@]}"; do
+              r="$(echo "$r" | xargs)"
+              if [ -z "$r" ]; then continue; fi
+              if [ -n "$inc" ]; then inc="$inc,"; fi
+              inc="$inc{\"distro\":\"$sel\",\"release\":\"$r\"}"
+            done
+            matrix="{\"include\":[$inc]}"
+          fi
+
+          # 输出必须是单行（GitHub step output 对多行敏感）
+          matrix="$(echo "$matrix" | jq -c .)"
+
+          # ---- 内核 ----
+          with_kernel=false
+          if [ "$IN_WITH_KERNEL" = "true" ]; then with_kernel=true; fi
+
+          kernel_repo="${IN_KERNEL_REPO:-$VAR_KERNEL_REPO}"
+          kernel_ref="${IN_KERNEL_REF:-$VAR_KERNEL_REF}"
+          kernel_def="${IN_KERNEL_DEFCONFIG:-$VAR_KERNEL_DEFCONFIG}"
+          kernel_def="${kernel_def:-defconfig}"
+
+          if [ "$with_kernel" = "true" ] && [ -z "$kernel_repo" ]; then
+            echo "::error::with_kernel=true 但没有内核仓库: 请填 kernel_repo 或设置仓库变量 KERNEL_REPO"
+            exit 1
+          fi
+
+          {
+            echo "matrix=$matrix"
+            echo "with_kernel=$with_kernel"
+            echo "kernel_repo=$kernel_repo"
+            echo "kernel_ref=$kernel_ref"
+            echo "kernel_defconfig=$kernel_def"
+            echo "size=$size"
+            echo "hostname=$hostname"
+            echo "retention_days=$retention"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "### 构建计划" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 矩阵: \`$(echo "$matrix" | jq -c '.include[] | .distro + "/" + .release' | tr '\n' ' ')\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 镜像大小: \`$size\` / 主机名: \`$hostname\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 内核模块: \`$with_kernel\` \`${kernel_repo:-none}\`@\`${kernel_ref:-default}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2) 内核(可选): 编译 -> 只导出模块压缩包, 供 rootfs 作业注入
+  #    未启用时本作业几十秒空转退出(保证 needs 链不塌)
+  # ---------------------------------------------------------------------------
+  kernel:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+      kver: ${{ steps.build.outputs.kver }}
+    env:
+      WITH_KERNEL: ${{ needs.plan.outputs.with_kernel }}
+      KERNEL_REPO: ${{ needs.plan.outputs.kernel_repo }}
+      KERNEL_REF: ${{ needs.plan.outputs.kernel_ref }}
+      KERNEL_DEFCONFIG: ${{ needs.plan.outputs.kernel_defconfig }}
+      CCACHE_DIR: ${{ runner.temp }}/ccache
+    steps:
+      - name: 是否跳过
+        id: check
+        run: |
+          if [ "$WITH_KERNEL" != "true" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "未启用内核构建，跳过"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装编译依赖
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm bc bison flex libelf-dev libssl-dev \
+            kmod cpio rsync zstd xz-utils ccache git ca-certificates
+          clang --version | head -1
+
+      - name: 恢复 ccache
+        if: steps.check.outputs.enabled == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-xaga-${{ needs.plan.outputs.kernel_ref }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-xaga-${{ needs.plan.outputs.kernel_ref }}-
+            ccache-xaga-
+
+      - name: 拉取内核源码
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          ref="${KERNEL_REF:-}"
+          mkdir -p "$BUILD_DIR"
+          cd "$BUILD_DIR"
+          rm -rf linux
+          if [ -n "$ref" ]; then
+            git clone --depth 1 --branch "$ref" "$KERNEL_REPO" linux
+          else
+            git clone --depth 1 "$KERNEL_REPO" linux
+          fi
+          git -C linux log -1 --oneline || true
+
+      - name: 编译内核与模块
+        if: steps.check.outputs.enabled == 'true'
+        id: build
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR/linux"
+          ccache -M 5G
+          nproc
+
+          make ARCH=arm64 LLVM=1 CC="ccache clang" O=out "$KERNEL_DEFCONFIG"
+          make ARCH=arm64 LLVM=1 CC="ccache clang" O=out -j"$(nproc)" vmlinux modules dtbs
+
+          KVER=$(make -s ARCH=arm64 O=out kernelrelease)
+          echo "内核版本: $KVER"
+          echo "kver=$KVER" >> "$GITHUB_OUTPUT"
+          echo "KVER=$KVER" >> "$GITHUB_ENV"
+
+          rm -rf "$BUILD_DIR/modinst"
+          make ARCH=arm64 O=out modules_install \
+               INSTALL_MOD_PATH="$BUILD_DIR/modinst" \
+               INSTALL_MOD_STRIP=1 DEPMOD=true
+
+      - name: 打包模块
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR"
+          ls modinst/lib/modules/
+          tar -C modinst --zstd -cf modules.tar.zst lib
+          ls -lh modules.tar.zst
+
+      - name: 打包启动产物（Image.gz / dtb / .config）
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR"
+          mkdir -p boot-out
+          cp linux/out/arch/arm64/boot/Image.gz boot-out/ 2>/dev/null || true
+          cp linux/out/.config boot-out/config-$KVER 2>/dev/null || true
+          mkdir -p boot-out/dtbs
+          find linux/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} boot-out/dtbs/ \; 2>/dev/null || true
+          tar --zstd -cf xaga-kernel-boot.tar.zst boot-out
+
+      - name: 上传模块包（仅本次运行内使用）
+        if: steps.check.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xaga-kernel-modules
+          path: ${{ env.BUILD_DIR }}/modules.tar.zst
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: 上传内核启动产物
+        if: steps.check.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xaga-kernel-boot
+          path: ${{ env.BUILD_DIR }}/xaga-kernel-boot.tar.zst
+          retention-days: ${{ needs.plan.outputs.retention_days }}
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 3) rootfs 矩阵构建
+  # ---------------------------------------------------------------------------
+  build:
+    needs: [plan, kernel]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      DISTRO: ${{ matrix.distro }}
+      RELEASE: ${{ matrix.release }}
+      SIZE: ${{ needs.plan.outputs.size }}
+      HOSTNAME: ${{ needs.plan.outputs.hostname }}
+      WITH_KERNEL: ${{ needs.kernel.outputs.enabled }}
+      KVER: ${{ needs.kernel.outputs.kver }}
+      ROOTPW: ${{ secrets.ROOT_PASSWORD || vars.ROOT_PASSWORD || '1234' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                     /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/lib/jvm 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装宿主依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user-static binfmt-support e2fsprogs file \
+            debootstrap mmdebstrap libarchive-tools \
+            android-sdk-libsparse-utils zstd curl ca-certificates jq
+          # 注册 binfmt（GH runner 上可能不可用，脚本本身能自动降级为显式 qemu）
+          sudo update-binfmts --enable qemu-aarch64 2>/dev/null || true
+          if [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            echo "binfmt: 已注册（chroot 直跑）"
+          else
+            echo "binfmt: 未注册（脚本会走 qemu-aarch64-static 解释器）"
+          fi
+          chmod +x make-rootfs.sh
+
+      - name: 缓存 Arch tarball
+        if: matrix.distro == 'arch'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUILD_DIR }}/ArchLinuxARM-aarch64-latest.tar.gz
+          key: archlinuxarm-aarch64-${{ github.run_id }}
+          restore-keys: archlinuxarm-aarch64-
+
+      - name: 下载内核模块包
+        if: needs.kernel.outputs.enabled == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: xaga-kernel-modules
+          path: ${{ env.KSTUB }}
+
+      # 用一个"桩"内核目录驱动 make-rootfs.sh 的模块安装分支：
+      #   - vmlinux + scripts/ 存在  -> 脚本进入第 3 步
+      #   - make kernelrelease       -> 桩 Makefile 回显真实 KVER
+      #   - make modules_install     -> 桩 Makefile 把模块包解到 INSTALL_MOD_PATH
+      #   - 随后脚本在 chroot 里 depmod -a <KVER> 生成 modules.dep
+      - name: 准备内核模块注入桩
+        if: needs.kernel.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$KSTUB/scripts"
+          sudo touch "$KSTUB/vmlinux"
+          test -f "$KSTUB/modules.tar.zst" || { echo "::error::缺少 modules.tar.zst"; exit 1; }
+          {
+            echo ".RECIPEPREFIX = >"
+            printf 'KVER := %s\n' "$KVER"
+            echo "INSTALL_MOD_PATH ?="
+            echo ".PHONY: kernelrelease modules_install"
+            echo "kernelrelease:"
+            echo '> @printf "%s\n" "$(KVER)"'
+            echo "modules_install:"
+            echo '> mkdir -p "$(INSTALL_MOD_PATH)"'
+            # --keep-directory-symlink: 别把 /lib -> usr/lib 的合并目录符号链接顶掉
+            echo '> tar --zstd --keep-directory-symlink -xf "$(CURDIR)/modules.tar.zst" -C "$(INSTALL_MOD_PATH)"'
+          } | sudo tee "$KSTUB/Makefile" >/dev/null
+          cat "$KSTUB/Makefile"
+
+      - name: 构建 rootfs
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$BUILD_DIR"
+          IMG="$BUILD_DIR/xaga-rootfs-${DISTRO}-${RELEASE}.img"
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+
+          KARG=()
+          if [ "$WITH_KERNEL" = "true" ]; then KARG=(-k "$KSTUB"); fi
+
+          # 不用 sudo -E：脚本的默认值已全部用 -o/-w/-k 显式覆盖，避免依赖 sudoers 的 SETENV
+          sudo ./make-rootfs.sh \
+            -d "$DISTRO" \
+            -r "$RELEASE" \
+            -s "$SIZE" \
+            -n "$HOSTNAME" \
+            -p "$ROOTPW" \
+            -w "$WORKDIR" \
+            -o "$IMG" \
+            "${KARG[@]}"
+          df -h /
+
+      - name: 校验镜像
+        run: |
+          set -euo pipefail
+          echo "--- e2fsck ---"
+          sudo e2fsck -fn "$IMG" || { echo "::error::e2fsck 报告文件系统错误"; exit 1; }
+          echo "--- 文件系统信息 ---"
+          sudo dumpe2fs -h "$IMG" | grep -E 'Filesystem volume name|Filesystem magic number|Filesystem features' || true
+
+          echo "--- /sbin/init 是否存在（init.c 写死 execve /sbin/init，缺了必黑屏）---"
+          sbin_list="$(sudo debugfs -R "ls -l /sbin" "$IMG" 2>/dev/null || true)"
+          echo "$sbin_list"
+          if echo "$sbin_list" | grep -Eq '[[:space:]]init( -> .*)?[[:space:]]*$'; then
+            echo "/sbin/init: OK"
+          else
+            echo "::error::镜像里没有 /sbin/init（若上面列表为空，是 debugfs 读取失败，需人工确认）"
+            exit 1
+          fi
+
+          if [ "$WITH_KERNEL" = "true" ]; then
+            echo "--- 内核模块 ---"
+            mod_list="$(sudo debugfs -R "ls -l /lib/modules/$KVER" "$IMG" 2>/dev/null || true)"
+            if echo "$mod_list" | grep -Eq '[[:space:]]modules\.dep[[:space:]]*$'; then
+              echo "modules.dep 已生成: OK"
+            else
+              echo "::warning::没找到 modules.dep，开机后需手动 depmod -a $KVER"
+            fi
+          fi
+
+      - name: 压缩并生成校验值
+        run: |
+          set -euo pipefail
+          sudo chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
+          cd "$BUILD_DIR"
+          base="$(basename "$IMG" .img)"
+          files=("$base.img")
+          if [ -f "$base-sparse.img" ]; then files+=("$base-sparse.img"); fi
+          # -S 保留稀疏属性，下载后 tar -xS 仍是稀疏文件，不占满磁盘
+          tar -cSf - "${files[@]}" | zstd -T0 -12 -o "$base.tar.zst"
+          sha256sum "$base.tar.zst" > SHA256SUMS-$base.txt
+          ls -lh "$base.tar.zst" SHA256SUMS-$base.txt
+          {
+            echo "### $base"
+            echo '```'
+            cat SHA256SUMS-$base.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 清理挂载与权限
+        if: always()
+        run: |
+          sudo umount -lf "$WORKDIR/proc" 2>/dev/null || true
+          sudo umount -lf "$WORKDIR/sys" 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" "$BUILD_DIR" 2>/dev/null || true
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: xaga-rootfs-${{ matrix.distro }}-${{ matrix.release }}
+          path: |
+            ${{ env.BUILD_DIR }}/xaga-rootfs-*.tar.zst
+            ${{ env.BUILD_DIR }}/SHA256SUMS-*.txt
+          retention-days: ${{ needs.plan.outputs.retention_days }}
+          if-no-files-found: error
+
+      - name: 附加到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.BUILD_DIR }}/xaga-rootfs-*.tar.zst
+            ${{ env.BUILD_DIR }}/SHA256SUMS-*.txt
+          generate_release_notes: true
