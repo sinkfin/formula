@@ -628,10 +628,48 @@ jobs:
             CHROOT_BIN="/usr/bin/qemu-aarch64-static /bin/bash"
           fi
           echo "CHROOT_BIN = $CHROOT_BIN"
-          sudo cp /etc/resolv.conf rootfs/etc/resolv.conf
+          # ---- resolv.conf：不能直接 cp 宿主机的 ----
+          # Ubuntu runner 的 /etc/resolv.conf 指向 systemd-resolved 的 stub
+          # （nameserver 127.0.0.53）。chroot 里没有 systemd-resolved 在跑，
+          # 这个地址是死的 —— pacman 会一路 "Could not resolve host:
+          # mirror.archlinuxarm.org"，然后 keyring 刷新 / -Syu / -S 全部失败。
+          # 写一份带公共 DNS 的真实文件；先 rm 掉原有路径：
+          # 若 rootfs/etc/resolv.conf 是软链接，cp 会顺着软链接写到目标去。
+          echo "== 宿主 /etc/resolv.conf（仅供参考，别指望它在 chroot 里能用）=="
+          ls -l /etc/resolv.conf || true
+          cat /etc/resolv.conf || true
+          sudo rm -f rootfs/etc/resolv.conf
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 223.5.5.5\n' \
+            | sudo tee rootfs/etc/resolv.conf > /dev/null
+          echo "== rootfs /etc/resolv.conf =="
+          cat rootfs/etc/resolv.conf
+
+          # ---- /dev：bind 宿主机的，别留成空目录 ----
+          # ALARM tarball 的 /dev 基本是空的，chroot 里连 /dev/fd 都没有，
+          # pacman-key 用的进程替换 <(...) 会报
+          # "/usr/sbin/pacman-key: line 196: /dev/fd/63: No such file or directory"。
+          # 只 bind /dev 本身就够了：宿主机 /dev/fd 是指向 /proc/self/fd 的软链接，
+          # 而 /proc 我们也挂了，所以 chroot 里 /dev/fd/63 能正常解析。
+          # 这个挂载必须在「打包 ext4」之前卸掉，否则 mkfs.ext4 -d 会把
+          # 宿主机整个 /dev 抄进 rootfs.img。
+          sudo mkdir -p rootfs/dev
+          sudo mount --bind /dev rootfs/dev
+
           sudo mkdir -p rootfs/proc rootfs/sys
           sudo mount -t proc  proc  rootfs/proc || true
           sudo mount -t sysfs sysfs rootfs/sys  || true
+
+          # chroot 内自检：DNS 不通的话下面 pacman 一定炸，先给出明确指向。
+          # 这里只 warn 不 fail —— getent 走 nsswitch，偶发误报不该把整次构建带崩。
+          sudo chroot rootfs /bin/bash -c '
+            echo "---- chroot 内 /etc/resolv.conf ----"
+            cat /etc/resolv.conf
+            echo "---- chroot 内 /dev ----"
+            ls /dev 2>&1 | head -20
+            getent ahosts mirror.archlinuxarm.org > /dev/null \
+              && echo "DNS OK: mirror.archlinuxarm.org 可解析" \
+              || echo "::warning::chroot 内 DNS 解析失败，下面 pacman 大概率报 Could not resolve host"
+          '
 
           sudo chroot rootfs ${CHROOT_BIN} -c '
           set -e
@@ -672,8 +710,17 @@ jobs:
       - name: 清理并校验关键项
         if: ${{ inputs.TASK != '仅内核' }}
         run: |
+          # /dev、/proc、/sys 都是挂载进来的，必须先卸：
+          # 不卸的话下一步 mkfs.ext4 -d rootfs 会把宿主机整个 /dev 抄进 rootfs.img。
+          sudo umount -lf rootfs/dev  || true
           sudo umount -lf rootfs/proc || true
           sudo umount -lf rootfs/sys  || true
+          # 兜底：万一还有残留挂载，mkfs 会把宿主机内容写进镜像，这里直接拦下来
+          if mountpoint -q rootfs/dev || mountpoint -q rootfs/proc || mountpoint -q rootfs/sys; then
+            echo "::error::rootfs 下还有未卸载的挂载点，会被 mkfs.ext4 -d 抄进镜像"
+            mount | grep -E "rootfs/(dev|proc|sys)" || true
+            exit 1
+          fi
           sudo rm -f rootfs/usr/bin/qemu-aarch64-static
           sudo rm -f rootfs/rootpw.txt rootfs/kver.txt
 
