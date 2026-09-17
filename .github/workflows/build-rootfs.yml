@@ -479,34 +479,6 @@ jobs:
           sudo bsdtar -xpf ArchLinuxARM-aarch64.tar.gz -C rootfs
           rm -f ArchLinuxARM-aarch64.tar.gz
 
-      - name: 体检 rootfs 布局（aarch64 动态加载器）
-        if: ${{ inputs.TASK != '仅内核' }}
-        run: |
-          echo "== /lib 布局 =="
-          ls -ld rootfs/lib rootfs/usr/lib 2>&1 || true
-          echo "== aarch64 loader =="
-          ls -l rootfs/usr/lib/ld-linux-aarch64.so.1 2>&1 || true
-          ls -l rootfs/lib/ld-linux-aarch64.so.1     2>&1 || true
-          echo "== /bin/bash =="
-          ls -lL rootfs/bin/bash 2>&1 || true
-
-          # Arch 是 /usr 合并布局：/lib 必须是软链接 -> usr/lib。
-          # 一旦解压后 /lib 成了真目录，chroot 里跑任何动态链接的 aarch64 程序都会报
-          # "Could not open '/lib/ld-linux-aarch64.so.1'" 然后 exit 255。
-          # 放在注入模块之前：模块有几百 MB，晚了就要多搬一趟。
-          if [ ! -e rootfs/lib/ld-linux-aarch64.so.1 ] \
-             && [ -e rootfs/usr/lib/ld-linux-aarch64.so.1 ]; then
-            echo "::warning::rootfs/lib 不是软链接，修复成 usr/lib 合并布局"
-            if [ -d rootfs/lib ] && [ ! -L rootfs/lib ]; then
-              sudo cp -a rootfs/lib/. rootfs/usr/lib/
-              sudo rm -rf rootfs/lib
-            fi
-            test -e rootfs/lib || sudo ln -sfn usr/lib rootfs/lib
-          fi
-          ls -ld rootfs/lib
-          test -e rootfs/lib/ld-linux-aarch64.so.1 \
-            || { echo "::error::rootfs 缺 aarch64 动态加载器 /lib/ld-linux-aarch64.so.1"; exit 1; }
-
       - name: 下载内核模块（本次运行）
         if: ${{ inputs.TASK != '仅内核' && !inputs.SKIP_MODULES && inputs.MODULES_RUN_ID == '' }}
         uses: actions/download-artifact@v4
@@ -538,8 +510,71 @@ jobs:
           test -n "$KVER" || { echo "::error::无法从 modules tar 识别内核版本"; exit 1; }
           echo "内核模块版本：$KVER"
           echo "$KVER" | sudo tee rootfs/kver.txt > /dev/null
-          sudo tar -xzf mods/xaga-modules.tar.gz -C rootfs
-          ls -lh rootfs/lib/modules/
+
+          # ⚠️ 必须解到 rootfs/usr，不能解到 rootfs 根！这是本工作流最容易炸的一步。
+          # modules tar 的成员路径是 lib/modules/<kver>/...，而 Arch 是 /usr 合并布局：
+          # rootfs/lib 是 -> usr/lib 的**软链接**。GNU tar 的默认行为是——
+          # 当归档里出现一个与现有软链接同名的目录时，它先 unlink 软链接、再建真目录
+          # （tar 手册 --keep-directory-symlink：By default ... tar would first remove
+          #   the symlink and then proceed extracting the directory）。
+          # 于是 /lib 被替换成一个只剩 modules 的真目录，
+          # /lib/ld-linux-aarch64.so.1 消失 → 下一步 chroot 直接报
+          #   chroot: failed to run command '/bin/bash': No such file or directory
+          # （bash 文件本身还在，但它的 PT_INTERP /lib/ld-linux-aarch64.so.1 没了，
+          #   execve 返回 ENOENT，chroot 就把 ENOENT 当成 "命令不存在" 报出来。）
+          # 同理也会解释 x86 + qemu 路线下那句 "Could not open '/lib/ld-linux-aarch64.so.1'"
+          # —— 那根本不是 binfmt preserve-argv0 的锅，是这里把 /lib 挖掉了。
+          #
+          # 解到 rootfs/usr 后，落点是 usr/lib/modules/<kver>，与 /lib/modules 等价，
+          # 且完全不碰 /lib 这个软链接，与 tar 版本/实现无关。
+          # 若哪天必须解到根，记得加 --keep-directory-symlink。
+          sudo tar -xzf mods/xaga-modules.tar.gz -C rootfs/usr
+          ls -lh rootfs/usr/lib/modules/
+
+      # ==========================================================
+      # 布局守卫（位置很关键！）
+      # 必须排在所有会写 rootfs 的步骤（解压 tarball、注入模块）之后、chroot 之前。
+      # 之前这步放在「注入模块」之前，只保证了刚解压时 /lib 是软链接，
+      # 模块一旦解包就把 /lib 换成真目录，检查早已跑完，白检。
+      # ==========================================================
+      - name: 体检 rootfs 布局（aarch64 动态加载器 / usr-merge）
+        if: ${{ inputs.TASK != '仅内核' }}
+        run: |
+          echo "== /lib /bin /sbin 布局 =="
+          ls -ld rootfs/lib rootfs/bin rootfs/sbin rootfs/usr/lib rootfs/usr/bin 2>&1 || true
+          echo "== aarch64 loader =="
+          ls -l rootfs/usr/lib/ld-linux-aarch64.so.1 2>&1 || true
+          ls -l rootfs/lib/ld-linux-aarch64.so.1     2>&1 || true
+          echo "== /bin/bash =="
+          ls -lL rootfs/bin/bash 2>&1 || true
+
+          # Arch 是 /usr 合并布局：根目录下的 /lib /bin /sbin 都必须是软链接 -> usr/*。
+          # 一旦变成真目录，chroot 里跑任何动态链接的 aarch64 程序都会炸：
+          #   /lib 被换掉 -> bash 的 PT_INTERP 找不到 -> execve ENOENT
+          #   -> "chroot: failed to run command '/bin/bash': No such file or directory"
+          #   或（qemu 路线）"Could not open '/lib/ld-linux-aarch64.so.1'" exit 255
+          # 这里做兜底：把真目录内容并回 usr/，再补回软链接。
+          fix_merge () {
+            local d="$1" t="$2"
+            if [ ! -e "rootfs$d" ] && [ -e "rootfs$t" ]; then
+              echo "::warning::rootfs$d 不存在，补软链接 -> ${t#/}"
+              sudo ln -sfn "${t#/}" "rootfs$d"
+            elif [ -d "rootfs$d" ] && [ ! -L "rootfs$d" ] && [ -e "rootfs$t" ]; then
+              echo "::warning::rootfs$d 不是软链接（被 tar 解包换成真目录了），并回 $t"
+              sudo cp -a "rootfs$d/." "rootfs$t/"
+              sudo rm -rf "rootfs$d"
+              sudo ln -sfn "${t#/}" "rootfs$d"
+            fi
+          }
+          fix_merge /lib  /usr/lib
+          fix_merge /bin  /usr/bin
+          fix_merge /sbin /usr/bin
+
+          ls -ld rootfs/lib rootfs/bin rootfs/sbin
+          test -e rootfs/lib/ld-linux-aarch64.so.1 \
+            || { echo "::error::rootfs 缺 aarch64 动态加载器 /lib/ld-linux-aarch64.so.1"; exit 1; }
+          test -x rootfs/bin/bash \
+            || { echo "::error::rootfs 里 /bin/bash 不存在或不可执行"; exit 1; }
 
       - name: 写 rootfs 基础配置
         if: ${{ inputs.TASK != '仅内核' }}
@@ -562,11 +597,26 @@ jobs:
       - name: chroot 配置系统
         if: ${{ inputs.TASK != '仅内核' }}
         run: |
-          # 关键改动：不再依赖 binfmt 去执行目标架构二进制。
-          # Ubuntu 24.04 的 qemu-aarch64 binfmt 以 preserve-argv0(-P)/credentials 方式注册，
-          # 在 chroot 下会报 "aarch64-binfmt-P: Could not open '/lib/ld-linux-aarch64.so.1'"
-          # 并 exit 255。显式把 qemu-aarch64-static 作为 chroot 的第一个程序执行可以
-          # 完全绕开 binfmt：qemu 本身是宿主机架构的静态二进制，由它再去翻译 /bin/bash。
+          # ---- 进 chroot 前的最后一道守卫 ----
+          # 若 /lib 不是软链接、或加载器/bash 丢了，chroot 只会甩一句
+          # "failed to run command '/bin/bash': No such file or directory"，
+          # 看着像 bash 不存在，其实文件在、是它的 PT_INTERP 没了。
+          # 在这里先把真正的原因点破，省得又去怀疑 binfmt。
+          ls -ld rootfs/lib rootfs/bin
+          test -e rootfs/lib/ld-linux-aarch64.so.1 \
+            || { echo "::error::rootfs/lib/ld-linux-aarch64.so.1 丢失 —— /lib 软链接被解包覆盖成真目录了"; ls -ld rootfs/lib; exit 1; }
+          test -x rootfs/bin/bash \
+            || { echo "::error::rootfs/bin/bash 不存在或不可执行"; ls -ld rootfs/bin rootfs/usr/bin/bash 2>&1 || true; exit 1; }
+
+          # runner 路线：
+          #   ARM64 原生 runner 直接 chroot，不用 qemu。
+          #   x86 runner 显式把 qemu-aarch64-static 作为 chroot 的第一个程序跑，
+          #   不经过 binfmt_misc 注册，少依赖 runner 内核的 binfmt 配置。
+          # ⚠️ 但别再写「binfmt preserve-argv0(-P)/credentials 导致
+          #    "aarch64-binfmt-P: Could not open '/lib/ld-linux-aarch64.so.1'" exit 255」
+          #    这种归因了 —— 那是**错的**。真正的元凶是上游「注入内核模块」那一步
+          #    的 tar 把 /lib 软链接换成了真目录（详见那段的注释），
+          #    x86/qemu 和 arm64/原生两条路线都会报同一个错，绕开 binfmt 治不了它。
           if [ "${{ inputs.RUNNER }}" = "ubuntu-24.04-arm" ]; then
             echo "ARM64 原生 runner，直接 chroot"
             CHROOT_BIN="/bin/bash"
@@ -626,6 +676,13 @@ jobs:
           sudo umount -lf rootfs/sys  || true
           sudo rm -f rootfs/usr/bin/qemu-aarch64-static
           sudo rm -f rootfs/rootpw.txt rootfs/kver.txt
+
+          # 打包前最后确认：/lib 被挖空的镜像刷进手机，连 /sbin/init 都起不来
+          test -e rootfs/lib/ld-linux-aarch64.so.1 \
+            || { echo "::error::rootfs 缺 aarch64 动态加载器，镜像刷进去必黑屏"; exit 1; }
+          test -x rootfs/bin/bash \
+            || { echo "::error::rootfs 缺可执行的 /bin/bash，镜像刷进去必黑屏"; exit 1; }
+          echo "/lib -> $(readlink rootfs/lib)"
 
           # init.c 写死 execve("/sbin/init")，缺了就是开机黑屏死循环
           if [ ! -e rootfs/sbin/init ] && [ -e rootfs/usr/lib/systemd/systemd ]; then
