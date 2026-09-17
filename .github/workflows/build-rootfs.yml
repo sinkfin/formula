@@ -2,7 +2,18 @@ name: Build Arch Linux RootFS (xaga mainline)
 
 # =============================================================================
 # 为 Redmi Note 11T Pro (xaga / MT6895 / 天玑8100) 主线 7.2 内核构建
-# Arch Linux ARM 根文件系统，并把当前内核编译出来的模块注进去。
+# Arch Linux ARM 根文件系统，并把内核模块注进去。
+#
+# 构建任务（TASK 输入）：
+#   全部     —— 编内核+模块+boot.img，再做 rootfs（默认）
+#   仅内核   —— 只出 boot.img / Image.gz / initramfs / modules
+#   仅RootFS —— 只做 rootfs，模块从「历史运行的 xaga-modules」下载
+#               （必须填 MODULES_RUN_ID，或勾选 SKIP_MODULES）
+#
+# ⚠️ 为什么三个 job 都不用 job-level if：
+#    GitHub Actions 里 needs 的 job 一旦被 skip，下游 job 会无条件跟着 skip，
+#    连 if: always() 也救不回来。所以本文件统一用 **step-level if** 控制，
+#    保证 needs 链不断、notify 总能发出来。
 #
 # 与旧工作流的差异（都是本轮实测踩出来的，别改回去）：
 #   1. defconfig 用 merge_config.sh 合并 defconfig + xaga.config。
@@ -14,10 +25,39 @@ name: Build Arch Linux RootFS (xaga mainline)
 #   5. rootfs 走 "解包到目录 + mkfs.ext4 -d"，**不依赖 loop 设备**。
 #   6. 内核模块由 kernel job 以 artifact 传入，注入后在 aarch64 chroot 里 depmod。
 #   7. 6+128 机型 cmdline 带 mem=6G（DT 的 memory 节点写死 8 GiB）。
+#   8. 内核版本从 modules tar 的目录名反推，不依赖 kernel job 的 output，
+#      这样「仅RootFS」模式拉历史 artifact 也能正确 depmod。
 # =============================================================================
 on:
   workflow_dispatch:
     inputs:
+      TASK:
+        description: "构建任务"
+        required: true
+        default: "全部"
+        type: choice
+        options:
+          - "全部"
+          - "仅内核"
+          - "仅RootFS"
+      RUNNER:
+        description: "rootfs 运行器（ARM64 原生 runner 可完全绕开 qemu；公开仓库免费）"
+        required: true
+        default: "ubuntu-latest"
+        type: choice
+        options:
+          - "ubuntu-latest"
+          - "ubuntu-24.04-arm"
+      MODULES_RUN_ID:
+        description: "【仅RootFS】从哪个历史 run 下载 xaga-modules（留空=本次运行）"
+        required: false
+        default: ""
+        type: string
+      SKIP_MODULES:
+        description: "跳过内核模块注入（rootfs 会没有 /lib/modules，仅调试用）"
+        required: false
+        default: false
+        type: boolean
       ROOTFS_SIZE:
         description: "rootfs 镜像大小"
         required: true
@@ -56,6 +96,41 @@ on:
         options:
           - "Image.gz"
           - "Image"
+      APPEND_DTB:
+        description: "把 dtb 拼到内核尾部（主线 arm64 不识别，默认关闭）"
+        required: false
+        default: false
+        type: boolean
+      BOOT_HEADER_VERSION:
+        description: "boot header 版本（原厂 xaga 是 4）"
+        required: true
+        default: "4"
+        type: string
+      BOOT_PAGESIZE:
+        description: "boot.img pagesize（原厂 xaga 是 4096）"
+        required: true
+        default: "4096"
+        type: string
+      BOOT_BASE:
+        description: "boot header base（留空=不传；MTK 建议由 unpackbootimg 解出原厂值填上）"
+        required: false
+        default: ""
+        type: string
+      BOOT_KERNEL_OFFSET:
+        description: "kernel_offset（留空=不传）"
+        required: false
+        default: ""
+        type: string
+      BOOT_RAMDISK_OFFSET:
+        description: "ramdisk_offset（留空=不传）"
+        required: false
+        default: ""
+        type: string
+      BOOT_TAGS_OFFSET:
+        description: "tags_offset（留空=不传）"
+        required: false
+        default: ""
+        type: string
       CLANG_VERSION:
         description: "LLVM Clang 版本"
         required: true
@@ -98,6 +173,8 @@ concurrency:
 jobs:
   # ==========================================================
   # Job 1：编译主线内核，产出内核模块 + boot.img
+  # （TASK=仅RootFS 时所有步骤被 step-level if 跳过，job 仍然 success，
+  #   这样下游 needs 不会被 skip 链带崩）
   # ==========================================================
   kernel:
     name: 编译主线内核 & 模块
@@ -106,10 +183,19 @@ jobs:
     outputs:
       kver: ${{ steps.kver.outputs.kver }}
     steps:
+      - name: 任务模式
+        run: |
+          echo "TASK = ${{ inputs.TASK }}"
+          if [ "${{ inputs.TASK }}" = "仅RootFS" ]; then
+            echo "跳过内核编译，rootfs 将使用历史 run 的 xaga-modules"
+          fi
+
       - name: Checkout 本仓库
+        if: ${{ inputs.TASK != '仅RootFS' }}
         uses: actions/checkout@v5
 
       - name: 安装依赖 & LLVM 工具链
+        if: ${{ inputs.TASK != '仅RootFS' }}
         run: |
           sudo apt update -y
           sudo apt install -y --no-install-recommends \
@@ -129,13 +215,17 @@ jobs:
           sudo ln -sf /usr/bin/llvm-objcopy-${CLANG_VER} /usr/bin/llvm-objcopy
           sudo ln -sf /usr/bin/llvm-readelf-${CLANG_VER} /usr/bin/llvm-readelf
           sudo ln -sf /usr/bin/llvm-strip-${CLANG_VER} /usr/bin/llvm-strip
+          # EFI libstub 的 STUBCPY 会调用 llvm-objdump，缺了会刷几十行 not found
+          sudo ln -sf /usr/bin/llvm-objdump-${CLANG_VER} /usr/bin/llvm-objdump
           llvm-ar --version
           llvm-nm --version
           llvm-objcopy --version
+          llvm-objdump --version
           ccache -M ${CCACHE_MAXSIZE}
           ccache -z
 
       - name: 安装 osm0sis mkbootimg
+        if: ${{ inputs.TASK != '仅RootFS' }}
         run: |
           git clone --depth=1 https://github.com/osm0sis/mkbootimg.git
           cd mkbootimg
@@ -146,6 +236,7 @@ jobs:
           mkbootimg 2>&1 | head -3
 
       - name: 拉取内核源码
+        if: ${{ inputs.TASK != '仅RootFS' }}
         run: |
           git clone -b ${{ env.KERNEL_BRANCH }} https://github.com/${{ env.KERNEL_REPO }}.git kernel
           cd kernel
@@ -155,6 +246,7 @@ jobs:
           fi
 
       - name: 生成 .config（defconfig + xaga fragment + 关冲突项）
+        if: ${{ inputs.TASK != '仅RootFS' }}
         working-directory: kernel
         run: |
           export ARCH=arm64
@@ -195,6 +287,7 @@ jobs:
           grep -E '^#? ?CONFIG_RUST$|CONFIG_DRM_PANIC_SCREEN|CONFIG_SND_SOC_MT(6895|8183)' .config || true
 
       - name: 全 LLVM 编译内核 + 模块
+        if: ${{ inputs.TASK != '仅RootFS' }}
         working-directory: kernel
         run: |
           make -j$(nproc) ARCH=arm64 \
@@ -204,6 +297,7 @@ jobs:
             Image.gz modules
 
       - name: 校验 DTB 是否链进 vmlinux
+        if: ${{ inputs.TASK != '仅RootFS' }}
         working-directory: kernel
         run: |
           nm vmlinux | grep mt6895_xiaomi_xaga_dtb_start \
@@ -211,11 +305,13 @@ jobs:
           ls -lh arch/arm64/boot/Image.gz arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb
 
       - name: 输出内核版本
+        if: ${{ inputs.TASK != '仅RootFS' }}
         id: kver
         working-directory: kernel
         run: echo "kver=$(make -s ARCH=arm64 kernelrelease)" >> $GITHUB_OUTPUT
 
       - name: 安装并打包内核模块
+        if: ${{ inputs.TASK != '仅RootFS' }}
         working-directory: kernel
         run: |
           mkdir -p ${{ github.workspace }}/mods
@@ -230,6 +326,7 @@ jobs:
           ls -lh ${{ github.workspace }}/xaga-modules.tar.gz
 
       - name: 上传内核模块
+        if: ${{ inputs.TASK != '仅RootFS' }}
         uses: actions/upload-artifact@v4
         with:
           name: xaga-modules
@@ -237,6 +334,7 @@ jobs:
           if-no-files-found: error
 
       - name: 构建 initramfs（物理分区版）
+        if: ${{ inputs.TASK != '仅RootFS' }}
         run: |
           git clone https://github.com/${{ env.INITRAMFS_REPO }}.git initramfs
           cd initramfs
@@ -250,42 +348,105 @@ jobs:
           cp initramfs.cpio.lz4 ../initramfs-physical.cpio.lz4
 
       - name: 打包 boot.img
+        if: ${{ inputs.TASK != '仅RootFS' }}
         run: |
           cd kernel
-          cat arch/arm64/boot/${{ inputs.KERNEL_IMAGE }} \
-              arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb > Image_with_dtb
-          hexdump -C Image_with_dtb | grep d00dfeed
+          KIMG="arch/arm64/boot/${{ inputs.KERNEL_IMAGE }}"
+          test -f "$KIMG" || { echo "::error::$KIMG 不存在，上一步编译产物缺失"; exit 1; }
+
+          # 主线 arm64 的 head.S 不扫描 appended DTB（只认 bootloader 从 x0 传进来的 FDT，
+          # 见 preserve_boot_args -> __fdt_pointer），而本树已经用 objcopy 把 DTB 链进
+          # vmlinux（上一步 nm 已验证），setup.c 会用内置 DTB 覆盖 LK 的 Android FDT。
+          # 所以默认不拼接；APPEND_DTB=true 才拼。
+          if [ "${{ inputs.APPEND_DTB }}" = "true" ]; then
+            cat "$KIMG" arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb > Image_with_dtb
+            # 正确校验 appended DTB magic：hexdump -C 输出的字节之间带空格
+            # （"d0 0d fe ed"），直接 grep d00dfeed 永远匹配不到 —— 这就是上一次跑挂的原因。
+            tail -c +$(( $(stat -c %s "$KIMG") + 1 )) Image_with_dtb \
+              | head -c 4 | od -An -tx1 | tr -d ' \n' \
+              | grep -qx d00dfeed \
+              || { echo "::error::appended DTB magic(d00dfeed) 未找到"; exit 1; }
+            echo "appended DTB magic OK"
+            KIMG="Image_with_dtb"
+          fi
+
           MEM_ARG=""
           if [ -n "${{ inputs.MEM_LIMIT }}" ]; then
             MEM_ARG="mem=${{ inputs.MEM_LIMIT }}"
           fi
+
+          # MTK v4 header 建议补齐 base / *_offset（取自原厂 boot.img），否则 LK 可能拒加载。
+          # 取值方法：unpackbootimg -i stock_boot.img，看 BOARD_KERNEL_BASE 那几行。
+          # 注意：这里必须用 if，不能写 [ -n "$X" ] && VAR=... —— bash -e 下条件为假会让整个 step 挂掉。
+          HDR_ARGS=""
+          if [ -n "${{ inputs.BOOT_BASE }}" ]; then
+            HDR_ARGS="${HDR_ARGS} --base ${{ inputs.BOOT_BASE }}"
+          fi
+          if [ -n "${{ inputs.BOOT_KERNEL_OFFSET }}" ]; then
+            HDR_ARGS="${HDR_ARGS} --kernel_offset ${{ inputs.BOOT_KERNEL_OFFSET }}"
+          fi
+          if [ -n "${{ inputs.BOOT_RAMDISK_OFFSET }}" ]; then
+            HDR_ARGS="${HDR_ARGS} --ramdisk_offset ${{ inputs.BOOT_RAMDISK_OFFSET }}"
+          fi
+          if [ -n "${{ inputs.BOOT_TAGS_OFFSET }}" ]; then
+            HDR_ARGS="${HDR_ARGS} --tags_offset ${{ inputs.BOOT_TAGS_OFFSET }}"
+          fi
+
           mkbootimg \
-            --kernel Image_with_dtb \
+            --header_version ${{ inputs.BOOT_HEADER_VERSION }} \
+            --pagesize ${{ inputs.BOOT_PAGESIZE }} \
+            ${HDR_ARGS} \
+            --kernel "$KIMG" \
             --ramdisk ../initramfs-physical.cpio.lz4 \
             --cmdline "earlycon=0x11200000,115200 root=${{ inputs.ROOT_PART }} rootfstype=ext4 loglevel=7 ${MEM_ARG}" \
             -o ../boot-arch.img
           ls -lh ../boot-arch.img
 
       - name: 上传 boot 产物
+        if: ${{ inputs.TASK != '仅RootFS' }}
         uses: actions/upload-artifact@v4
         with:
           name: xaga-boot
+          # kernel/Image_with_dtb 只在 APPEND_DTB=true 时才会生成
           path: |
             boot-arch.img
-            kernel/Image_with_dtb
             initramfs-physical.cpio.lz4
-          if-no-files-found: error
+            kernel/Image_with_dtb
+          if-no-files-found: warn
 
   # ==========================================================
   # Job 2：构建 Arch Linux ARM rootfs（注入内核模块）
   # ==========================================================
   arch-rootfs:
     name: 构建 Arch Linux ARM rootfs
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.RUNNER }}
     timeout-minutes: 60
     needs: kernel
     steps:
+      - name: 任务模式 & 参数校验
+        run: |
+          echo "TASK = ${{ inputs.TASK }}"
+          if [ "${{ inputs.TASK }}" = "仅内核" ]; then
+            echo "跳过 rootfs 构建"
+            exit 0
+          fi
+          # 提前把无效组合挡掉，免得跑 20 分钟才发现拉不到模块
+          if [ "${{ inputs.TASK }}" = "仅RootFS" ] \
+             && [ -z "${{ inputs.MODULES_RUN_ID }}" ] \
+             && [ "${{ inputs.SKIP_MODULES }}" != "true" ]; then
+            echo "::error::仅RootFS 模式下必须填 MODULES_RUN_ID（历史运行 ID），或勾选 SKIP_MODULES"
+            exit 1
+          fi
+          if [ -n "${{ inputs.MODULES_RUN_ID }}" ]; then
+            echo "模块来源：run ${{ inputs.MODULES_RUN_ID }} 的 xaga-modules"
+          elif [ "${{ inputs.SKIP_MODULES }}" = "true" ]; then
+            echo "模块来源：跳过（SKIP_MODULES=true）"
+          else
+            echo "模块来源：本次运行的 xaga-modules"
+          fi
+
       - name: 安装依赖
+        if: ${{ inputs.TASK != '仅内核' }}
         run: |
           sudo apt update -y
           sudo apt install -y --no-install-recommends \
@@ -293,6 +454,7 @@ jobs:
             qemu-user-static binfmt-support android-sdk-libsparse-utils
 
       - name: 注册 aarch64 binfmt（chroot 里跑 pacman 需要）
+        if: ${{ inputs.TASK != '仅内核' && inputs.RUNNER != 'ubuntu-24.04-arm' }}
         run: |
           sudo update-binfmts --enable qemu-aarch64 || true
           if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
@@ -304,54 +466,124 @@ jobs:
             docker run --privileged --rm multiarch/qemu-user-static --reset -p yes || true
           fi
           ls /proc/sys/fs/binfmt_misc/ || true
+          echo "== 当前 qemu-aarch64 的 binfmt flags =="
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null || true
 
       - name: 下载并解压 Arch Linux ARM aarch64
+        if: ${{ inputs.TASK != '仅内核' }}
         run: |
           wget -q --show-progress -O ArchLinuxARM-aarch64.tar.gz \
             http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
           mkdir -p rootfs
           # bsdtar 保住 xattr / capabilities；普通 tar 会丢，ping、sudo 这类会失效
           sudo bsdtar -xpf ArchLinuxARM-aarch64.tar.gz -C rootfs
+          rm -f ArchLinuxARM-aarch64.tar.gz
 
-      - name: 下载内核模块
+      - name: 体检 rootfs 布局（aarch64 动态加载器）
+        if: ${{ inputs.TASK != '仅内核' }}
+        run: |
+          echo "== /lib 布局 =="
+          ls -ld rootfs/lib rootfs/usr/lib 2>&1 || true
+          echo "== aarch64 loader =="
+          ls -l rootfs/usr/lib/ld-linux-aarch64.so.1 2>&1 || true
+          ls -l rootfs/lib/ld-linux-aarch64.so.1     2>&1 || true
+          echo "== /bin/bash =="
+          ls -lL rootfs/bin/bash 2>&1 || true
+
+          # Arch 是 /usr 合并布局：/lib 必须是软链接 -> usr/lib。
+          # 一旦解压后 /lib 成了真目录，chroot 里跑任何动态链接的 aarch64 程序都会报
+          # "Could not open '/lib/ld-linux-aarch64.so.1'" 然后 exit 255。
+          # 放在注入模块之前：模块有几百 MB，晚了就要多搬一趟。
+          if [ ! -e rootfs/lib/ld-linux-aarch64.so.1 ] \
+             && [ -e rootfs/usr/lib/ld-linux-aarch64.so.1 ]; then
+            echo "::warning::rootfs/lib 不是软链接，修复成 usr/lib 合并布局"
+            if [ -d rootfs/lib ] && [ ! -L rootfs/lib ]; then
+              sudo cp -a rootfs/lib/. rootfs/usr/lib/
+              sudo rm -rf rootfs/lib
+            fi
+            test -e rootfs/lib || sudo ln -sfn usr/lib rootfs/lib
+          fi
+          ls -ld rootfs/lib
+          test -e rootfs/lib/ld-linux-aarch64.so.1 \
+            || { echo "::error::rootfs 缺 aarch64 动态加载器 /lib/ld-linux-aarch64.so.1"; exit 1; }
+
+      - name: 下载内核模块（本次运行）
+        if: ${{ inputs.TASK != '仅内核' && !inputs.SKIP_MODULES && inputs.MODULES_RUN_ID == '' }}
         uses: actions/download-artifact@v4
         with:
           name: xaga-modules
           path: mods
+          if-no-files-found: error
 
-      - name: 注入内核模块
+      # 仅RootFS 走这条：跨 run 下载必须带 github-token
+      - name: 下载内核模块（指定历史 run）
+        if: ${{ inputs.TASK != '仅内核' && !inputs.SKIP_MODULES && inputs.MODULES_RUN_ID != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: xaga-modules
+          path: mods
+          run-id: ${{ inputs.MODULES_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          if-no-files-found: error
+
+      - name: 注入内核模块并识别内核版本
+        if: ${{ inputs.TASK != '仅内核' && !inputs.SKIP_MODULES }}
         run: |
+          test -f mods/xaga-modules.tar.gz || { echo "::error::mods/xaga-modules.tar.gz 不存在"; exit 1; }
+          # 从 tar 里的目录名反推内核版本：这样「仅RootFS」拉历史 artifact 也能对上，
+          # 不依赖 kernel job 的 output（会被 sudo/chroot 清掉环境变量，所以落盘成文件）
+          KVER=$(tar -tzf mods/xaga-modules.tar.gz \
+                 | sed -n 's|^lib/modules/\([^/]*\)/.*|\1|p' \
+                 | sort -u | head -n1)
+          test -n "$KVER" || { echo "::error::无法从 modules tar 识别内核版本"; exit 1; }
+          echo "内核模块版本：$KVER"
+          echo "$KVER" | sudo tee rootfs/kver.txt > /dev/null
           sudo tar -xzf mods/xaga-modules.tar.gz -C rootfs
           ls -lh rootfs/lib/modules/
-          echo "${{ needs.kernel.outputs.kver }}" | sudo tee rootfs/kver.txt > /dev/null
 
       - name: 写 rootfs 基础配置
+        if: ${{ inputs.TASK != '仅内核' }}
         run: |
           printf 'xaga\n' | sudo tee rootfs/etc/hostname > /dev/null
-          sudo tee rootfs/etc/hosts > /dev/null <<'EOF'
-          127.0.0.1       localhost
-          127.0.1.1       xaga
-          ::1             localhost ip6-localhost ip6-loopback
-          EOF
+          printf '%s\n' \
+            '127.0.0.1       localhost' \
+            '127.0.1.1       xaga' \
+            '::1             localhost ip6-localhost ip6-loopback' \
+            | sudo tee rootfs/etc/hosts > /dev/null
           # init.c 硬编码 ext4 挂载，root 必须指向物理分区
-          sudo tee rootfs/etc/fstab > /dev/null <<'EOF'
-          # <device>  <mount>  <type>  <options>                          <dump> <pass>
-          ${{ inputs.ROOT_PART }}  /  ext4  defaults,noatime,errors=remount-ro  0  1
-          EOF
+          printf '%s\n' \
+            '# <device>  <mount>  <type>  <options>  <dump> <pass>' \
+            '${{ inputs.ROOT_PART }}  /  ext4  defaults,noatime,errors=remount-ro  0  1' \
+            | sudo tee rootfs/etc/fstab > /dev/null
           cat rootfs/etc/fstab
           printf 'root:%s\n' '${{ inputs.ROOT_PASSWORD }}' | sudo tee rootfs/rootpw.txt > /dev/null
           sudo chmod 600 rootfs/rootpw.txt
 
       - name: chroot 配置系统
+        if: ${{ inputs.TASK != '仅内核' }}
         run: |
-          sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
-          sudo rm -f rootfs/etc/resolv.conf
+          # 关键改动：不再依赖 binfmt 去执行目标架构二进制。
+          # Ubuntu 24.04 的 qemu-aarch64 binfmt 以 preserve-argv0(-P)/credentials 方式注册，
+          # 在 chroot 下会报 "aarch64-binfmt-P: Could not open '/lib/ld-linux-aarch64.so.1'"
+          # 并 exit 255。显式把 qemu-aarch64-static 作为 chroot 的第一个程序执行可以
+          # 完全绕开 binfmt：qemu 本身是宿主机架构的静态二进制，由它再去翻译 /bin/bash。
+          if [ "${{ inputs.RUNNER }}" = "ubuntu-24.04-arm" ]; then
+            echo "ARM64 原生 runner，直接 chroot"
+            CHROOT_BIN="/bin/bash"
+          else
+            test -x /usr/bin/qemu-aarch64-static \
+              || { echo "::error::/usr/bin/qemu-aarch64-static 不存在"; exit 1; }
+            file /usr/bin/qemu-aarch64-static || true
+            sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
+            CHROOT_BIN="/usr/bin/qemu-aarch64-static /bin/bash"
+          fi
+          echo "CHROOT_BIN = $CHROOT_BIN"
           sudo cp /etc/resolv.conf rootfs/etc/resolv.conf
           sudo mkdir -p rootfs/proc rootfs/sys
           sudo mount -t proc  proc  rootfs/proc || true
           sudo mount -t sysfs sysfs rootfs/sys  || true
 
-          sudo chroot rootfs /bin/bash -c '
+          sudo chroot rootfs ${CHROOT_BIN} -c '
           set -e
           pacman-key --init
           pacman-key --populate archlinuxarm
@@ -378,12 +610,17 @@ jobs:
           rm -f /rootpw.txt
           ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
-          depmod -a "$(cat /kver.txt)"
-          rm -f /kver.txt
+          if [ -f /kver.txt ]; then
+            depmod -a "$(cat /kver.txt)"
+            rm -f /kver.txt
+          else
+            echo "::warning::没有 /kver.txt，跳过 depmod（SKIP_MODULES 模式）"
+          fi
           pacman -Scc --noconfirm || true
           '
 
       - name: 清理并校验关键项
+        if: ${{ inputs.TASK != '仅内核' }}
         run: |
           sudo umount -lf rootfs/proc || true
           sudo umount -lf rootfs/sys  || true
@@ -404,10 +641,15 @@ jobs:
           test -e rootfs/etc/systemd/system/multi-user.target.wants/NetworkManager.service \
             || echo "::warning::NetworkManager 未开机自启"
 
+          # 联发科固件缺了 WiFi/蓝牙/声卡/触控全废
+          test -d rootfs/lib/firmware/mediatek \
+            || echo "::warning::rootfs 缺 /lib/firmware/mediatek，WiFi/蓝牙/声卡/触控会废"
+
           ls -l rootfs/sbin/init
-          ls -l rootfs/lib/modules/
+          ls -l rootfs/lib/modules/ || true
 
       - name: 打包 ext4 镜像（不使用 loop 设备）
+        if: ${{ inputs.TASK != '仅内核' }}
         run: |
           truncate -s ${{ inputs.ROOTFS_SIZE }} rootfs.img
           sudo mkfs.ext4 -F -L xaga-root -d rootfs rootfs.img
@@ -416,6 +658,7 @@ jobs:
           ls -lh rootfs.img rootfs-sparse.img
 
       - name: 上传 rootfs 产物（sparse）
+        if: ${{ inputs.TASK != '仅内核' }}
         uses: actions/upload-artifact@v4
         with:
           name: arch-rootfs
@@ -423,7 +666,7 @@ jobs:
           if-no-files-found: error
 
       - name: 上传原始 rootfs.img
-        if: ${{ inputs.UPLOAD_RAW_IMG }}
+        if: ${{ inputs.TASK != '仅内核' && inputs.UPLOAD_RAW_IMG }}
         uses: actions/upload-artifact@v4
         with:
           name: arch-rootfs-raw
@@ -446,6 +689,7 @@ jobs:
         id: status
         run: |
           overall="success"
+          # skipped 不算失败（TASK 模式下被跳过的 job 是正常的）
           for r in "${{ needs.kernel.result }}" "${{ needs.arch-rootfs.result }}"; do
             if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
               overall="failure"
